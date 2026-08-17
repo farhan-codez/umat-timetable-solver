@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>UMaT-SRID Timetable</title>
+  <link rel="stylesheet" href="/static/style.css?v=15">
+</head>
+<body>
+  <header>
+    <div class="brand">UMaT-SRID <span>Timetable Builder</span></div>
+    <nav>
+      <button data-tab="timetable" class="active">Timetable</button>
+      <button data-tab="courses">Courses</button>
+      <button data-tab="rooms">Rooms</button>
+      <button data-tab="cohorts">Cohorts</button>
+    </nav>
+    <div class="semester-pick">
+      <label for="semester">Semester</label>
+      <select id="semester"></select>
+    </div>
+    <div id="login-wrap">
+      <span id="login-state" class="login-state"></span>
+      <button id="login-btn" class="btn ghost">Login</button>
+    </div>
+  </header>
+
+  <main>
+    <section id="tab-courses" class="tab">
+      <div class="panel-head">
+        <h2>Courses</h2>
+        <div class="toolbar">
+          <input id="search-courses" type="search" placeholder="Search code / name / programme / lecturer...">
+          <button id="add-courses" class="btn">+ Add course</button>
+          <button id="toggle-advanced-courses" class="btn ghost" title="Show/hide teaching hours (TPC), sections, credits and engine values">Advanced fields</button>
+          <button id="reload-courses" class="btn ghost">Reload</button>
+          <button id="save-courses" class="btn primary"><span>Save changes</span><span id="badge-courses" class="badge"></span></button>
+        </div>
+      </div>
+      <div class="table-wrap" id="wrap-courses"></div>
+      <div class="hint" id="hint-courses" hidden>Add a course: type the course name and code, pick the programme and level, name the lecturer, then mark its delivery — online (yes/no), field work (yes/no), and hours per session. One row per course: the class composition (sections) is derived automatically from the Cohorts tab for that programme and level, and a course with a combined A+B class above 90 students is automatically split into one class per section, each keeping the full teaching hours (TPC). Courses shared with another programme (e.g. CE 158/PM 138) are marked with a "!" badge — their class composition is kept as-is and can be seen under Advanced fields. Use "Advanced fields" only to set the teaching hours (TPC), sections, credits, and engine values — these stay the same every semester unless the department changes them.</div>
+    </section>
+
+    <section id="tab-rooms" class="tab">
+      <div class="panel-head">
+        <h2>Rooms</h2>
+        <div class="toolbar">
+          <input id="search-rooms" type="search" placeholder="Search room...">
+          <button id="add-rooms" class="btn">+ Add room</button>
+          <button id="reload-rooms" class="btn ghost">Reload</button>
+          <button id="save-rooms" class="btn primary"><span>Save changes</span><span id="badge-rooms" class="badge"></span></button>
+        </div>
+      </div>
+      <div class="table-wrap" id="wrap-rooms"></div>
+    </section>
+
+    <section id="tab-cohorts" class="tab">
+      <div class="panel-head">
+        <h2>Cohorts</h2>
+        <div class="toolbar">
+          <input id="search-cohorts" type="search" placeholder="Search programme / section...">
+          <button id="add-cohorts" class="btn">+ Add cohort</button>
+          <button id="reload-cohorts" class="btn ghost">Reload</button>
+          <button id="save-cohorts" class="btn primary"><span>Save changes</span><span id="badge-cohorts" class="badge"></span></button>
+        </div>
+      </div>
+      <div class="table-wrap" id="wrap-cohorts"></div>
+    </section>
+
+    <section id="tab-timetable" class="tab">
+      <div class="panel-head">
+        <h2>Timetable</h2>
+        <div class="toolbar">
+          <button id="run-solve" class="btn primary">Generate Timetable</button>
+          <button id="publish" class="btn ghost">Publish</button>
+          <button id="reload-timetable" class="btn ghost">Refresh</button>
+          <a id="download-xlsx" class="btn ghost" href="/api/timetable.xlsx">Download xlsx</a>
+        </div>
+      </div>
+      <div id="publish-result" class="hint" hidden></div>
+
+      <div id="solve-status" class="status"></div>
+
+      <div id="solve-overlay">
+        <div id="solve-anim">
+          <div class="loader loader-grid"></div>
+          <div class="loader loader-dominoes"></div>
+          <div class="loader loader-dots"></div>
+          <div class="loader loader-glitch" data-text="BUILDING TIMETABLE">BUILDING TIMETABLE</div>
+          <div class="loader loader-terminal">
+            <div class="terminal-loader">
+              <div class="terminal-header">
+                <div class="terminal-title">Status</div>
+                <div class="terminal-controls">
+                  <div class="control close"></div>
+                  <div class="control minimize"></div>
+                  <div class="control maximize"></div>
+                </div>
+              </div>
+              <div class="text">Loading...</div>
+            </div>
+          </div>
+          <div class="loader loader-rings">
+            <svg class="pl" width="240" height="240" viewBox="0 0 240 240">
+              <circle class="pl__ring pl__ring--a" cx="120" cy="120" r="105" fill="none" stroke="#000" stroke-width="20" stroke-dasharray="0 660" stroke-dashoffset="-330" stroke-linecap="round"></circle>
+              <circle class="pl__ring pl__ring--b" cx="120" cy="120" r="35" fill="none" stroke="#000" stroke-width="20" stroke-dasharray="0 220" stroke-dashoffset="-110" stroke-linecap="round"></circle>
+              <circle class="pl__ring pl__ring--c" cx="85" cy="120" r="70" fill="none" stroke="#000" stroke-width="20" stroke-dasharray="0 440" stroke-linecap="round"></circle>
+              <circle class="pl__ring pl__ring--d" cx="155" cy="120" r="70" fill="none" stroke="#000" stroke-width="20" stroke-dasharray="0 440" stroke-linecap="round"></circle>
+            </svg>
+          </div>
+        </div>
+        <div id="solve-text">Starting solve...</div>
+        <div id="solve-elapsed"></div>
+        <div id="solve-metrics"></div>
+      </div>
+
+      <div id="summary" class="cards"></div>
+
+      <div class="panel-head">
+        <h2>Generated timetable</h2>
+        <div class="toolbar">
+          <select id="grid-kind">
+            <option value="day" selected>Day</option>
+            <option value="cohort">Cohort</option>
+            <option value="lecturer">Lecturer</option>
+            <option value="room">Room</option>
+          </select>
+          <select id="grid-pick"></select>
+          <button id="grid-today" class="btn ghost">Highlight today</button>
+        </div>
+      </div>
+      <div id="legend" class="legend"></div>
+      <div id="grid" class="grid-wrap"></div>
+    </section>
+  </main>
+
+  <div id="toast"></div>
+  <div id="login-modal" class="modal" hidden>
+    <div class="modal-box">
+      <h3>Admin login</h3>
+      <p>Enter the admin password to edit data or generate timetables.</p>
+      <input id="login-pass" type="password" placeholder="Admin password" autocomplete="current-password">
+      <div class="modal-actions">
+        <button id="login-cancel" class="btn ghost">Cancel</button>
+        <button id="login-ok" class="btn primary">Login</button>
+      </div>
+    </div>
+  </div>
+  <script src="/static/app.js?v=15"></script>
+</body>
+</html>

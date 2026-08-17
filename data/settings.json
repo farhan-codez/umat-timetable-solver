@@ -1,0 +1,11 @@
+{
+  "weights": {
+    "room_oversize": 2,
+    "evening": 4,
+    "cohort_gap": 10,
+    "lecturer_gap": 6,
+    "early_utilization": 6,
+    "lecturer_overlap": 200,
+    "online": 8
+  }
+}
