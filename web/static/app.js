@@ -9,9 +9,10 @@ const LABELS = {
   },
   rooms: { name: "Name", capacity: "Capacity", kind: "Kind" },
   cohorts: { programme: "Prog", level: "Level", section: "Section", size: "Size" },
+  lecturers: { name: "Name" },
 };
 
-const COL_KEYS = { courses: "course_columns", rooms: "room_columns", cohorts: "cohort_columns" };
+const COL_KEYS = { courses: "course_columns", rooms: "room_columns", cohorts: "cohort_columns", lecturers: "lecturer_columns" };
 
 const COURSE_BASIC_GROUPS = [
   { label: "Course", cols: ["course_code", "course_name"] },
@@ -34,9 +35,9 @@ const COLORS = {
 };
 const FALLBACK = "#64748b";
 
-const meta = { days: [], slot_times: [], course_columns: [], room_columns: [], cohort_columns: [] };
-const state = { courses: [], rooms: [], cohorts: [] };
-const saved = { courses: [], rooms: [], cohorts: [] };
+const meta = { days: [], slot_times: [], course_columns: [], room_columns: [], cohort_columns: [], lecturer_columns: [] };
+const state = { courses: [], rooms: [], cohorts: [], lecturers: [] };
+const saved = { courses: [], rooms: [], cohorts: [], lecturers: [] };
 let timetable = { summary: {}, rows: [] };
 let hlToday = false;
 let semester = "sem2";
@@ -183,6 +184,7 @@ const COURSE_SELECTS = {
   level: () => [...new Set(state.cohorts.map((x) => String(x.level)).filter(Boolean))].sort(),
   online: () => ["yes", "no"],
   field_work: () => ["no", "yes"],
+  lecturer: () => [...new Set(state.lecturers.map((x) => x.name).filter(Boolean))].sort(),
 };
 
 function sectionsForCourse(r) {
@@ -931,6 +933,13 @@ async function runSolve() {
 
 /* ---------------- init ---------------- */
 
+async function loadLecturers() {
+  const lecturers = await api("/api/lecturers");
+  state.lecturers = lecturers;
+  saved.lecturers = clone(lecturers);
+  tableFor("lecturers");
+}
+
 async function loadSemesterData() {
   const [courses, rooms, cohorts] = await Promise.all([
     api(withSem("/api/courses")), api(withSem("/api/rooms")), api(withSem("/api/cohorts")),
@@ -966,13 +975,14 @@ async function init() {
     Object.keys(meta.semesters).forEach((key) => sel.appendChild(new Option(meta.semesters[key], key)));
     sel.value = semester;
     $("download-xlsx").href = withSem("/api/timetable.xlsx");
+    await loadLecturers();
     await loadSemesterData();
     activateTab(location.hash ? location.hash.slice(1) : "timetable");
     await loadTimetable();
   } catch (e) { toast(e.message, true); }
 }
 
-wire("courses"); wire("rooms"); wire("cohorts");
+wire("courses"); wire("rooms"); wire("cohorts"); wire("lecturers");
 $("run-solve").addEventListener("click", runSolve);
 $("reload-timetable").addEventListener("click", loadTimetable);
 $("grid-kind").addEventListener("change", buildGridOptions);

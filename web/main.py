@@ -1,5 +1,6 @@
 import json
 import os
+import random
 import secrets
 import sys
 import threading
@@ -45,6 +46,9 @@ COURSE_COLUMNS = [
 ]
 ROOM_COLUMNS = ["name", "capacity", "kind"]
 COHORT_COLUMNS = ["programme", "level", "section", "size"]
+LECTURER_COLUMNS = ["name"]
+
+LECTURERS_FILE = DATA_DIR / "lecturers.xlsx"
 
 SOLVER_CONFIG = "soft_lecturer=False;compact=2;online_in_person=1;physical_never_online=1"
 
@@ -404,6 +408,17 @@ def _validate_cohorts(rows):
         _int_value(row.get("size"), f"{row.get('programme')}{row.get('level')}: size")
 
 
+def _validate_lecturers(rows):
+    seen = set()
+    for row in rows:
+        name = str(row.get("name") or "").strip()
+        if not name:
+            raise ValueError("every lecturer needs a name")
+        if name in seen:
+            raise ValueError(f"duplicate lecturer: {name}")
+        seen.add(name)
+
+
 def _save(path, rows, columns, validator, label):
     try:
         validator(rows)
@@ -501,6 +516,7 @@ def meta():
             "course_columns": COURSE_COLUMNS,
             "room_columns": ROOM_COLUMNS,
             "cohort_columns": COHORT_COLUMNS,
+            "lecturer_columns": LECTURER_COLUMNS,
             "student_app_url": STUDENT_APP_URL}
 
 
@@ -539,6 +555,16 @@ def put_cohorts(payload: list[dict], semester: str = "sem2", _: bool = Depends(r
     return _save(_sem_path(semester) / "cohorts.xlsx", payload, COHORT_COLUMNS, _validate_cohorts, "cohorts")
 
 
+@app.get("/api/lecturers")
+def get_lecturers():
+    return _read_table(LECTURERS_FILE, LECTURER_COLUMNS, key="name")
+
+
+@app.put("/api/lecturers")
+def put_lecturers(payload: list[dict], _: bool = Depends(require_admin)):
+    return _save(LECTURERS_FILE, payload, LECTURER_COLUMNS, _validate_lecturers, "lecturers")
+
+
 def _build_problem(sem):
     from src.loaders import load_problem
 
@@ -573,7 +599,7 @@ def _run_solve(job_id, time_limit, semester):
             # an optimization objective is intentionally skipped - on this data
             # CP-SAT cannot even finish presolve for that model within minutes.
             phase1 = solve(problem, time_limit=min(max(time_limit, 120), 300),
-                           minimize_objective=False, feasibility_jump=True, seed=42, progress_cb=live_cb("phase1"))
+                           minimize_objective=False, feasibility_jump=True, seed=random.randint(1, 2**31 - 1), progress_cb=live_cb("phase1"))
             result = phase1
             if result.status in ("OPTIMAL", "FEASIBLE"):
                 from regen import postprocess

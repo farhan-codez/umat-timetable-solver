@@ -14,6 +14,7 @@
       <button data-tab="courses">Courses</button>
       <button data-tab="rooms">Rooms</button>
       <button data-tab="cohorts">Cohorts</button>
+      <button data-tab="lecturers">Lecturers</button>
     </nav>
     <div class="semester-pick">
       <label for="semester">Semester</label>
@@ -65,6 +66,19 @@
         </div>
       </div>
       <div class="table-wrap" id="wrap-cohorts"></div>
+    </section>
+
+    <section id="tab-lecturers" class="tab">
+      <div class="panel-head">
+        <h2>Lecturers</h2>
+        <div class="toolbar">
+          <input id="search-lecturers" type="search" placeholder="Search lecturer name...">
+          <button id="add-lecturers" class="btn">+ Add lecturer</button>
+          <button id="reload-lecturers" class="btn ghost">Reload</button>
+          <button id="save-lecturers" class="btn primary"><span>Save changes</span><span id="badge-lecturers" class="badge"></span></button>
+        </div>
+      </div>
+      <div class="table-wrap" id="wrap-lecturers"></div>
     </section>
 
     <section id="tab-timetable" class="tab">

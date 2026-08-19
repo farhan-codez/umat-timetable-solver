@@ -26,7 +26,9 @@ echo  ============================================================
 echo   UMaT-SRID Timetable Builder
 echo  ============================================================
 echo.
-echo   Your browser will open automatically.
+echo   Open your browser and go to: http://127.0.0.1:8000
+echo   (or http://<this-computer-ip>:8000 from other computers)
+echo.
 echo   To stop the app, close this window.
 echo.
 echo   If your firewall asks, allow access so other computers can view it.
@@ -37,7 +39,6 @@ if exist ".env" (
     for /f "tokens=1,* delims==" %%A in ('findstr /b /v "#" ".env"') do set "%%A=%%B"
 )
 
-start "" http://127.0.0.1:8000
 ".venv\Scripts\python.exe" -m uvicorn web.main:app --host 0.0.0.0 --port 8000
 echo.
 echo   The server has stopped.

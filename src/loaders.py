@@ -11,6 +11,7 @@ from .solver import SolverWeights
 ROOMS_FILE = "rooms.xlsx"
 COHORTS_FILE = "cohorts.xlsx"
 COURSES_FILE = "courses.xlsx"
+LECTURERS_FILE = "lecturers.xlsx"
 SETTINGS_FILE = "settings.json"
 
 ONLINE_TRUE = {"yes", "y", "1", "true", "online"}
@@ -195,6 +196,25 @@ def load_cohorts(path):
             raise ValueError(f"Duplicate cohort {c.id}")
         cohorts[c.id] = c
     return cohorts
+
+
+def load_lecturers(path):
+    """Load global lecturers list. Returns list of dicts with 'name' key."""
+    if not Path(path).exists():
+        return []
+    df = pd.read_excel(path)
+    lecturers = []
+    for _, row in df.iterrows():
+        name = _clean_text(row.get("name", ""))
+        if name:
+            lecturers.append({"name": name})
+    return lecturers
+
+
+def save_lecturers(path, lecturers):
+    """Save global lecturers list."""
+    df = pd.DataFrame(lecturers, columns=["name"])
+    df.to_excel(path, index=False)
 
 
 def load_courses(path, cohorts, max_capacity=120, split_combined_above=SPLIT_COMBINED_ABOVE):

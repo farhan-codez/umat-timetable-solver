@@ -45,11 +45,13 @@ def _rearrange_delta(arr, removals, additions):
 
 
 class Packer:
-    def __init__(self, problem, assignments, debug=False, allow_plateau=False):
+    def __init__(self, problem, assignments, debug=False, allow_plateau=False, rng=None):
+        import random
         self.sessions = problem["sessions"]
         self.debug = debug
         self.allow_plateau = allow_plateau
         self.tie_eps = 0.001 if allow_plateau else 0.0
+        self.rng = rng if rng is not None else random.Random()
         self.allowed = {s.id: _allowed_rooms(s, problem["rooms"]) for s in self.sessions}
         self.starts = {s.id: _allowed_starts(s) for s in self.sessions}
         self.assign = {a.session.id: a for a in assignments}
@@ -185,7 +187,9 @@ class Packer:
     def relocate_pass(self, deadline=None):
         holes = self.holes
         moves = 0
-        for s in self.sessions:
+        sessions = list(self.sessions)
+        self.rng.shuffle(sessions)
+        for s in sessions:
             a = self.assign[s.id]
             if getattr(s, "fixed_slot", None) is not None:
                 continue
@@ -271,7 +275,9 @@ class Packer:
     def swap_pass(self, active_ids, deadline=None):
         moves = 0
         checked = 0
-        for sid in active_ids:
+        active = list(active_ids)
+        self.rng.shuffle(active)
+        for sid in active:
             a1 = self.assign[sid]
             s1 = a1.session
             if getattr(s1, "fixed_slot", None) is not None:
@@ -348,7 +354,9 @@ class Packer:
     def _try_fill(self, t, r, depth, moved):
         if depth == 0:
             return False
-        for s in self.sessions:
+        sessions = list(self.sessions)
+        self.rng.shuffle(sessions)
+        for s in sessions:
             if s.id in moved:
                 continue
             if t not in self.starts[s.id] or r not in self.allowed[s.id]:
@@ -392,6 +400,6 @@ class Packer:
         return rounds
 
 
-def pack(problem, assignments, time_budget=180.0, max_rounds=400, debug=False, allow_plateau=False):
-    p = Packer(problem, assignments, debug=debug, allow_plateau=allow_plateau)
+def pack(problem, assignments, time_budget=180.0, max_rounds=400, debug=False, allow_plateau=False, rng=None):
+    p = Packer(problem, assignments, debug=debug, allow_plateau=allow_plateau, rng=rng)
     return p.run(time_budget, max_rounds)
