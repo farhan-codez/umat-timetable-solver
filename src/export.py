@@ -1,6 +1,7 @@
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
+import json
 
 from .slots import DAYS, N_SLOTS, SLOTS_PER_DAY, SLOT_TIMES, day_index_of, slot_in_day
 from .solver import FIELD_WORK_ROOM, ONLINE_ROOM, _is_no_room
@@ -198,6 +199,7 @@ def _daily_room_row(ws, row, room, capacity, by_slot):
     ws.cell(row=row, column=1).alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
     ws.cell(row=row, column=1).border = BORDER
 
+    BREAK_COL = 8  # column H in the daily sheet
     used = set()
     for sl in range(SLOTS_PER_DAY):
         a = by_slot.get(sl)
@@ -206,6 +208,8 @@ def _daily_room_row(ws, row, room, capacity, by_slot):
         span = max(1, a.session.duration)
         first = _excel_col_for_slot(sl)
         last = _excel_col_for_slot(min(sl + span - 1, SLOTS_PER_DAY - 1))
+        if first < BREAK_COL < last:
+            last = BREAK_COL - 1
         if any(c in used for c in range(first, last + 1)):
             continue
         used.update(range(first, last + 1))
@@ -225,39 +229,6 @@ def _daily_room_row(ws, row, room, capacity, by_slot):
         if not _is_merged(ws, row, col):
             cell.border = BORDER
     ws.row_dimensions[row].height = 36
-
-
-def _no_room_sheet(book, assignments, existing, base_name, room, fill, type_label):
-    ws = _sheet_names(book, base_name, existing)
-    headers = ["Day", "Time", "Course Code", "Course", "Programme",
-               "Level", "Cohort", "Lecturer", "Duration", "Type"]
-    for col, h in enumerate(headers, start=1):
-        ws.cell(row=1, column=col, value=h)
-    _style_header(ws, len(headers))
-    rows = []
-    for a in assignments:
-        if a.room != room:
-            continue
-        c = a.session.course
-        rows.append([
-            DAYS[day_index_of(a.slot)],
-            SLOT_TIMES[slot_in_day(a.slot)],
-            c.code, c.name, c.programme, c.level, _section_label(a), c.lecturer,
-            a.session.duration, type_label,
-        ])
-    for i, values in enumerate(sorted(rows, key=lambda r: (r[0], r[1], r[2])), start=2):
-        for col, v in enumerate(values, start=1):
-            ws.cell(row=i, column=col, value=v).fill = fill
-    for col, w in zip(range(1, len(headers) + 1), [10, 13, 12, 34, 12, 7, 7, 20, 9, 8]):
-        ws.column_dimensions[get_column_letter(col)].width = w
-
-
-def _vle_sheet(book, assignments, existing):
-    _no_room_sheet(book, assignments, existing, "VLE Online", ONLINE_ROOM, ONLINE_FILL, "Online")
-
-
-def _field_sheet(book, assignments, existing):
-    _no_room_sheet(book, assignments, existing, "Field Work", FIELD_WORK_ROOM, FIELD_FILL, "Field Work")
 
 
 def _cell_text(a, include_cohort):
@@ -321,67 +292,8 @@ def export_all(problem, result, output_dir):
     existing = set()
     book.remove(book.active)
 
-    master = book.create_sheet(title="Master (List)")
-    headers = [
-        "Day", "Time", "Room", "Course Code", "Course", "Programme",
-        "Level", "Cohort", "Lecturer", "Lecture Hrs", "Practical Hrs", "Credits", "Duration", "Type",
-    ]
-    for col, h in enumerate(headers, start=1):
-        master.cell(row=1, column=col, value=h)
-    _style_header(master, len(headers))
-
-    for i, a in enumerate(sorted(assignments, key=lambda x: (x.slot, x.room)), start=2):
-        c = a.session.course
-        values = [
-            DAYS[day_index_of(a.slot)],
-            SLOT_TIMES[slot_in_day(a.slot)],
-            _room_text(a),
-            c.code,
-            c.name,
-            c.programme,
-            c.level,
-            _section_label(a),
-            c.lecturer,
-            c.lecture_hours,
-            c.practical_hours,
-            c.credits,
-            a.session.duration,
-            "Online" if a.room == ONLINE_ROOM else ("Field Work" if a.room == FIELD_WORK_ROOM else "Class"),
-        ]
-        for col, v in enumerate(values, start=1):
-            cell = master.cell(row=i, column=col, value=v)
-            if a.room == ONLINE_ROOM:
-                cell.fill = ONLINE_FILL
-            elif a.room == FIELD_WORK_ROOM:
-                cell.fill = FIELD_FILL
-    for col, w in zip(range(1, len(headers) + 1), [10, 13, 12, 12, 34, 12, 7, 7, 20, 11, 12, 8, 9, 8]):
-        master.column_dimensions[get_column_letter(col)].width = w
-
     rooms = [r for r in problem["rooms"]]
     _daily_sheets(book, assignments, rooms, cohorts, existing)
-    _vle_sheet(book, assignments, existing)
-    _field_sheet(book, assignments, existing)
-
-    weekly = book.create_sheet(title="Weekly Grid")
-    weekly.cell(row=1, column=1, value="Time")
-    for col, day in enumerate(DAYS, start=2):
-        weekly.cell(row=1, column=col, value=day)
-    _style_header(weekly, 1 + len(DAYS))
-    for sl in range(SLOTS_PER_DAY):
-        row = sl + 2
-        weekly.cell(row=row, column=1, value=SLOT_TIMES[sl])
-        for day in range(len(DAYS)):
-            lines = []
-            for a in assignments:
-                if day_index_of(a.slot) == day and slot_in_day(a.slot) == sl:
-                    lines.append(_cell_text(a, True))
-            if lines:
-                cell = weekly.cell(row=row, column=day + 2, value="\n".join(lines))
-                cell.alignment = WRAP
-        weekly.row_dimensions[row].height = 70
-    weekly.column_dimensions["A"].width = 16
-    for col in range(2, 2 + len(DAYS)):
-        weekly.column_dimensions[get_column_letter(col)].width = 36
 
     by_section = {sec: [] for sec in problem["sections"]}
     for a in assignments:
@@ -399,41 +311,25 @@ def export_all(problem, result, output_dir):
 
     _grid_sheet(book, "Lecturer", by_lecturer, lambda lec: lec, existing)
 
-    room_usage = book.create_sheet(title="Room Usage")
-    rooms = [r.name for r in problem["rooms"]]
-    room_usage.cell(row=1, column=1, value="Slot")
-    for col, r in enumerate(rooms, start=2):
-        cap = next(x.capacity for x in problem["rooms"] if x.name == r)
-        room_usage.cell(row=1, column=col, value=f"{r} ({cap})")
-    _style_header(room_usage, 1 + len(rooms))
-
-    occupied = {r: set() for r in rooms}
-    usage_rows = []
-    for sl in range(N_SLOTS):
-        cells = {}
-        for a in assignments:
-            if a.slot != sl or _is_no_room(a.room):
-                continue
-            occupied[a.room].add(sl)
-            col = rooms.index(a.room) + 2
-            existing = cells.get(col)
-            cells[col] = f"{existing}\n{a.session.course.code}" if existing else a.session.course.code
-        if cells:
-            usage_rows.append(sl)
-            row = sl + 2
-            room_usage.cell(row=row, column=1, value=SLOT_TIMES[slot_in_day(sl)])
-            for col, text in cells.items():
-                room_usage.cell(row=row, column=col, value=text)
-    util_row = len(usage_rows) + 3
-    room_usage.cell(row=util_row, column=1, value="Utilisation").font = Font(bold=True)
-    for r in rooms:
-        cell = room_usage.cell(row=util_row, column=rooms.index(r) + 2)
-        cell.value = f"{len(occupied[r])}/{N_SLOTS} ({len(occupied[r]) / N_SLOTS:.0%})"
-        cell.font = Font(bold=True)
-    room_usage.column_dimensions["A"].width = 20
-    for col in range(2, 2 + len(rooms)):
-        room_usage.column_dimensions[get_column_letter(col)].width = 18
-
     out_path = output_dir / "timetable.xlsx"
     book.save(out_path)
+
+    rows = []
+    for a in sorted(assignments, key=lambda x: (x.slot, x.room)):
+        c = a.session.course
+        rows.append({
+            "day": DAYS[day_index_of(a.slot)],
+            "time": SLOT_TIMES[slot_in_day(a.slot)],
+            "room": "ONLINE" if a.room == ONLINE_ROOM else ("FIELD WORK" if a.room == FIELD_WORK_ROOM else a.room),
+            "code": c.code,
+            "name": c.name,
+            "programme": c.programme,
+            "level": c.level,
+            "cohort": _section_label(a),
+            "lecturer": c.lecturer,
+            "type": "Online" if a.room == ONLINE_ROOM else ("Field Work" if a.room == FIELD_WORK_ROOM else "Class"),
+            "duration": a.session.duration,
+        })
+    (output_dir / "timetable_rows.json").write_text(json.dumps(rows, indent=2), encoding="utf-8")
+
     return out_path

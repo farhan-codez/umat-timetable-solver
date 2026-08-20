@@ -670,13 +670,17 @@ def get_job(job_id: str):
 
 @app.get("/api/timetable")
 def get_timetable(semester: str = "sem2"):
-    path = _sem_out(semester) / "timetable.xlsx"
     summary = {}
     if (_sem_out(semester) / "solve_result.json").exists():
         summary = json.loads((_sem_out(semester) / "solve_result.json").read_text(encoding="utf-8"))
+    json_path = _sem_out(semester) / "timetable_rows.json"
+    if json_path.exists():
+        rows = json.loads(json_path.read_text(encoding="utf-8"))
+        return {"summary": summary, "rows": rows}
+    path = _sem_out(semester) / "timetable.xlsx"
     if not path.exists():
         return {"summary": summary, "rows": []}
-    df = pd.read_excel(path, sheet_name="Master (List)")
+    df = pd.read_excel(path, sheet_name=0)
     rows = []
     for _, r in df.iterrows():
         rows.append({
