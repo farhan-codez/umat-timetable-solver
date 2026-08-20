@@ -620,6 +620,64 @@ function renderGrid() {
   grid.replaceChildren(table);
 }
 
+function splitOverlappingRows(bySlot, nSlots) {
+  // Split overlapping sessions into separate rows so each is clearly visible
+  // Each row represents a "track" where no sessions overlap
+  const tracks = [];
+  const placedSessions = new Set(); // Track sessions we've already placed
+  for (let si = 0; si < nSlots; si++) {
+    const sessions = bySlot[si] || [];
+    sessions.forEach((session) => {
+      // Skip if already placed (session appears in multiple slots due to duration > 1)
+      const sessionKey = session.code + "_" + session.time + "_" + (session.programme || "") + "_" + (session.cohort || "");
+      if (placedSessions.has(sessionKey)) return;
+      placedSessions.add(sessionKey);
+
+      const dur = Math.max(1, parseInt(session.duration, 10) || 1);
+      // Find first track where this session fits (no overlap)
+      let placed = false;
+      for (let t = 0; t < tracks.length; t++) {
+        let conflict = false;
+        for (let k = 0; k < dur; k++) {
+          const slotIdx = si + k;
+          if (slotIdx >= nSlots) { conflict = true; break; }
+          if (tracks[t][slotIdx] && tracks[t][slotIdx].some(s => s !== session)) {
+            conflict = true;
+            break;
+          }
+        }
+        if (!conflict) {
+          for (let k = 0; k < dur; k++) {
+            const slotIdx = si + k;
+            if (slotIdx >= nSlots) break;
+            tracks[t][slotIdx] = tracks[t][slotIdx] || [];
+            tracks[t][slotIdx].push(session);
+          }
+          placed = true;
+          break;
+        }
+      }
+      if (!placed) {
+        const newTrack = {};
+        for (let k = 0; k < dur; k++) {
+          const slotIdx = si + k;
+          if (slotIdx >= nSlots) break;
+          newTrack[slotIdx] = [session];
+        }
+        tracks.push(newTrack);
+      }
+    });
+  }
+  // Convert tracks to row maps (only include slots that have sessions)
+  return tracks.map(track => {
+    const rowMap = {};
+    for (let si = 0; si < nSlots; si++) {
+      if (track[si]) rowMap[si] = track[si];
+    }
+    return rowMap;
+  });
+}
+
 function renderDayGrid() {
   const grid = $("grid");
   const day = $("grid-pick").value;
@@ -681,7 +739,7 @@ function renderDayGrid() {
       hr2.appendChild(th);
       const thb = document.createElement("th");
       thb.className = "break";
-      thb.textContent = "\u2615 BREAK";
+      thb.textContent = "BREAK";
       hr2.appendChild(thb);
     } else {
       const th = document.createElement("th");
@@ -713,7 +771,7 @@ function renderDayGrid() {
       const td = document.createElement("td");
       if (ci === BREAK_COL) {
         td.className = "break";
-        td.textContent = "\u2615";
+        td.textContent = "";
       }
       if (ci === 1 || ci === 2 || ci === 12 || ci === 13) td.classList.add("offpeak");
       cells[ci] = td;
@@ -724,10 +782,11 @@ function renderDayGrid() {
       return (hrs > 1 ? hrs + "h · " : "") + `${r.programme} ${r.level}${r.cohort}`;
     };
     for (let si = 0; si < nSlots; si++) {
+      const c0 = colFor(si);
+      if (skipCols.has(c0)) continue;
       const list = slotMap[si];
       if (!list || !list.length) continue;
-      const dur = kind === "online" ? 1 : Math.max(1, parseInt(list[0].duration, 10) || 1);
-      const c0 = colFor(si);
+      const dur = Math.max(1, parseInt(list[0].duration, 10) || 1);
       let c1 = colFor(Math.min(si + dur - 1, nSlots - 1));
       if (c0 <= 6 && c1 >= 8) c1 = c0; // never span across the lunch-break column
       const cell = cells[c0];
@@ -753,9 +812,17 @@ function renderDayGrid() {
   };
 
   const fwCount = Object.values(fieldBySlot).reduce((a, l) => a + l.length, 0);
-  renderRow(`FIELD WORK${fwCount ? ` (${fwCount})` : ""}`, fieldBySlot, "field");
+  const fwRows = splitOverlappingRows(fieldBySlot, nSlots);
+  fwRows.forEach((rowMap, idx) => {
+    renderRow(idx === 0 ? `FIELD WORK${fwCount ? ` (${fwCount})` : ""}` : "", rowMap, "field");
+  });
   rooms.forEach((r) => renderRow(roomLabel(r), byRoom[r] || {}, ""));
-  renderRow("ONLINE (VLE)", onlineBySlot, "online");
+
+  // Online: split overlapping sessions into separate rows so each is clearly visible
+  const onlineRows = splitOverlappingRows(onlineBySlot, nSlots);
+  onlineRows.forEach((rowMap, idx) => {
+    renderRow(idx === 0 ? "ONLINE (VLE)" : "", rowMap, "online");
+  });
   table.appendChild(tbody);
   grid.replaceChildren(table);
 }
