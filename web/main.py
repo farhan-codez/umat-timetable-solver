@@ -178,6 +178,18 @@ def _derivable_sections(prog, lv, cohorts):
             and str(c.get("section") or "").strip()}
 
 
+def _code_for_prog(merged_name, prog, fallback):
+    """For a merged name like 'CE 158/PM 138', return the code matching *prog*."""
+    if not merged_name or "/" not in str(merged_name):
+        return fallback
+    import re
+    for part in str(merged_name).split("/"):
+        m = re.search(r"([A-Z]{1,3})\s*(\d+)", part.strip())
+        if m and m.group(1).upper() == prog.upper():
+            return f"{m.group(1)} {m.group(2)}"
+    return fallback
+
+
 def _collapse_courses(rows, cohorts):
     """Group the expanded per-delivery rows into one row per course+programme+level.
 
@@ -222,21 +234,39 @@ def _collapse_courses(rows, cohorts):
         derivable = _derivable_sections(prog, lv_i, cohorts)
         sections = "" if (union and union == derivable) else ",".join(sorted(union))
 
-        lecturers = sorted({str(r.get("lecturer") or "").strip() for r in rs if str(r.get("lecturer") or "").strip()})
+        from src.loaders import _canonical_lecturer
+
+        lecturer = ""
+        for r in rs:
+            raw = str(r.get("lecturer") or "").strip()
+            if raw:
+                for part in raw.split("/"):
+                    canon = _canonical_lecturer(part)
+                    if canon:
+                        lecturer = canon
+                        break
+            if lecturer:
+                break
         online = "yes" if any(_truthy(r.get("online")) for r in rs) else "no"
         field_work = "yes" if any(_truthy(r.get("field_work")) for r in rs) else "no"
         split_vals = {str(r.get("split") or "").strip().lower() for r in rs if str(r.get("split") or "").strip()}
         split = split_vals.pop() if len(split_vals) == 1 else ""
 
+        merged_name = first("course_name")
+        display_code = _code_for_prog(merged_name, prog, code)
+        is_merged = bool(merged_name and "/" in str(merged_name))
+
         out.append({
-            "course_code": code, "course_name": first("course_name"), "programme": prog,
-            "level": lv, "cohort": "", "lecturer": " / ".join(lecturers),
+            "course_code": display_code,
+            "course_name": display_code if is_merged else merged_name, "programme": prog,
+            "level": lv, "cohort": "", "lecturer": lecturer,
             "lecture_hours": maxnum("lecture_hours"), "practical_hours": maxnum("practical_hours"),
             "credits": maxnum("credits"), "online": online, "field_work": field_work,
             "hours_per_session": mode("hours_per_session") or 2, "sessions_per_week": "",
             "min_room_size": maxnum("min_room_size"), "sections": sections, "split": split,
             "size": "", "special": bool(sections),
-            "group_id": first("group_id"), "group_size": first("group_size"),
+            "group_id": "" if is_merged else first("group_id"),
+            "group_size": "" if is_merged else first("group_size"),
         })
     return out
 
@@ -557,7 +587,18 @@ def put_cohorts(payload: list[dict], semester: str = "sem2", _: bool = Depends(r
 
 @app.get("/api/lecturers")
 def get_lecturers():
-    return _read_table(LECTURERS_FILE, LECTURER_COLUMNS, key="name")
+    from src.loaders import _canonical_lecturer
+
+    rows = _read_table(LECTURERS_FILE, LECTURER_COLUMNS, key="name")
+    seen = set()
+    out = []
+    for r in rows:
+        canonical = _canonical_lecturer(r.get("name"))
+        if canonical and canonical not in seen:
+            seen.add(canonical)
+            r["name"] = canonical
+            out.append(r)
+    return out
 
 
 @app.put("/api/lecturers")
@@ -619,7 +660,7 @@ def _run_solve(job_id, time_limit, semester):
             summary = {
                 "status": result.status,
                 "objective": round(result.objective) if result.objective != float("inf") else None,
-                "conflicts": {k: result.checks[k] for k in ("section", "room", "capacity")},
+                "conflicts": {k: result.checks.get(k, 0) for k in ("section", "room", "capacity")},
                 "lecturer_overlaps": result.checks.get("lecturer", 0),
                 "sessions": len(problem["sessions"]),
                 "sections": len(problem["sections"]),

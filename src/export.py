@@ -143,47 +143,56 @@ def _daily_sheets(book, assignments, rooms, cohorts, existing):
             _daily_room_row(ws, row, room.name, room.capacity, by_room[room.name])
             row += 1
 
-        row = _daily_online_row(ws, row, day_idx, assignments)
-        row = _daily_field_row(ws, row, day_idx, assignments)
+        row = _daily_online_rows(ws, row, day_idx, assignments)
+        row = _daily_field_rows(ws, row, day_idx, assignments)
 
         ws.freeze_panes = "B9"
 
 
-def _daily_no_room_row(ws, row, day_idx, assignments, room, fill):
+def _daily_no_room_rows(ws, start_row, day_idx, assignments, room, fill):
     from collections import defaultdict
+    label = "ONLINE (VLE)" if room == ONLINE_ROOM else "FIELD WORK"
     onl = [a for a in assignments if a.room == room and day_index_of(a.slot) == day_idx]
-    cell = ws.cell(row=row, column=1, value="ONLINE (VLE)" if room == ONLINE_ROOM else "FIELD WORK")
-    cell.font = Font(name="Arial", size=10, bold=True)
-    cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    cell.border = BORDER
-    cell.fill = fill
 
     by_slot = defaultdict(list)
     for a in onl:
         by_slot[slot_in_day(a.slot)].append(a)
 
-    for sl in range(SLOTS_PER_DAY):
-        col = _excel_col_for_slot(sl)
-        cell = ws.cell(row=row, column=col)
-        cell.fill = fill
+    n_rows = max((len(v) for v in by_slot.values()), default=0)
+    if n_rows == 0:
+        n_rows = 1
+
+    for ri in range(n_rows):
+        row = start_row + ri
+        cell = ws.cell(row=row, column=1, value=label)
+        cell.font = Font(name="Arial", size=10, bold=True)
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
         cell.border = BORDER
-        cell.alignment = WRAP
-        classes = by_slot.get(sl)
-        if classes:
-            cell.value = "\n".join(
-                f"{a.session.course.code} {_section_label(a)}\n{a.session.course.lecturer}"
-                for a in sorted(classes, key=lambda a: a.session.course.code)
-            )
-    ws.row_dimensions[row].height = 60
-    return row + 1
+        cell.fill = fill
+
+        for sl in range(SLOTS_PER_DAY):
+            col = _excel_col_for_slot(sl)
+            cell = ws.cell(row=row, column=col)
+            cell.fill = fill
+            cell.border = BORDER
+            cell.alignment = WRAP
+            classes = by_slot.get(sl, [])
+            if ri < len(classes):
+                a = classes[ri]
+                c = a.session.course
+                cell.value = f"{c.code} {_section_label(a)}\n{c.lecturer}"
+
+        ws.row_dimensions[row].height = 60
+
+    return start_row + n_rows
 
 
-def _daily_online_row(ws, row, day_idx, assignments):
-    return _daily_no_room_row(ws, row, day_idx, assignments, ONLINE_ROOM, ONLINE_FILL)
+def _daily_online_rows(ws, row, day_idx, assignments):
+    return _daily_no_room_rows(ws, row, day_idx, assignments, ONLINE_ROOM, ONLINE_FILL)
 
 
-def _daily_field_row(ws, row, day_idx, assignments):
-    return _daily_no_room_row(ws, row, day_idx, assignments, FIELD_WORK_ROOM, FIELD_FILL)
+def _daily_field_rows(ws, row, day_idx, assignments):
+    return _daily_no_room_rows(ws, row, day_idx, assignments, FIELD_WORK_ROOM, FIELD_FILL)
 
 
 def _is_merged(ws, row, col):
@@ -213,7 +222,8 @@ def _daily_room_row(ws, row, room, capacity, by_slot):
         if any(c in used for c in range(first, last + 1)):
             continue
         used.update(range(first, last + 1))
-        ws.merge_cells(start_row=row, start_column=first, end_row=row, end_column=last)
+        if first < last:
+            ws.merge_cells(start_row=row, start_column=first, end_row=row, end_column=last)
         c = a.session.course
         text = f"{c.code} {_section_label(a)}\n{c.lecturer}"
         cell = ws.cell(row=row, column=first, value=text)

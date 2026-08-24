@@ -33,13 +33,13 @@
         <div class="toolbar">
           <input id="search-courses" type="search" placeholder="Search code / name / programme / lecturer...">
           <button id="add-courses" class="btn">+ Add course</button>
-          <button id="toggle-advanced-courses" class="btn ghost" title="Show/hide teaching hours (TPC), sections, credits and engine values">Advanced fields</button>
+          <button id="toggle-advanced-courses" class="btn ghost" title="Show/hide teaching hours (TPC)">Teaching hours (TPC)</button>
           <button id="reload-courses" class="btn ghost">Reload</button>
           <button id="save-courses" class="btn primary"><span>Save changes</span><span id="badge-courses" class="badge"></span></button>
         </div>
       </div>
       <div class="table-wrap" id="wrap-courses"></div>
-      <div class="hint" id="hint-courses" hidden>Add a course: type the course name and code, pick the programme and level, name the lecturer, then mark its delivery — online (yes/no), field work (yes/no), and hours per session. One row per course: the class composition (sections) is derived automatically from the Cohorts tab for that programme and level, and a course with a combined A+B class above 90 students is automatically split into one class per section, each keeping the full teaching hours (TPC). Courses shared with another programme (e.g. CE 158/PM 138) are marked with a "!" badge — their class composition is kept as-is and can be seen under Advanced fields. Use "Advanced fields" only to set the teaching hours (TPC), sections, credits, and engine values — these stay the same every semester unless the department changes them.</div>
+        <div class="hint" id="hint-courses" hidden>Add a course: type the course name and code, pick the programme and level, name the lecturer, then mark its delivery — online (yes/no), field work (yes/no), and hours per session. One row per course: the class composition (sections) is derived automatically from the Cohorts tab for that programme and level. Courses shared with another programme (e.g. CE 158/PM 138) are marked with a "!" badge. Use "Teaching hours (TPC)" to set the lecture and practical hours — these stay the same every semester unless the department changes them.</div>
     </section>
 
     <section id="tab-rooms" class="tab">
@@ -160,6 +160,6 @@
       </div>
     </div>
   </div>
-  <script src="/static/app.js?v=15"></script>
+  <script src="/static/app.js?v=20"></script>
 </body>
 </html>

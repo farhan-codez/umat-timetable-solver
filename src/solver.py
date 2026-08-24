@@ -103,6 +103,9 @@ def _allowed_starts(session):
         # (never the 06:30/07:30 early blocks, never the evening).
         if session.field_work and not (FIELD_WORK_START_MIN <= s <= FIELD_WORK_START_MAX):
             continue
+        # Level 200+ in-person sessions cannot start before 08:30
+        if session.course.level >= 200 and not session.online and s < 2:
+            continue
         out.append(t)
     return out
 

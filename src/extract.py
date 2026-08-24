@@ -369,9 +369,12 @@ def extract_timetable(path, data_dir, output_dir=None):
         # through its section list).  A single offer keeps its own row.
         if len(resolved) > 1:
             counts = Counter(o["lecturer"] for o, _, _ in resolved)
+            # Prefer a non-empty lecturer name over empty string
+            non_empty = {k: v for k, v in counts.items() if k}
+            lecturer = max(non_empty, key=non_empty.get) if non_empty else ""
             primary = resolved[0]
             offer = dict(primary[0])
-            offer["lecturer"] = counts.most_common(1)[0][0]
+            offer["lecturer"] = lecturer
             cohort = primary[1]
             section_ids = set().union(*(sid for _, _, sid in resolved))
             merged_name = "/".join(sorted({o["code"] for o, _, _ in resolved}))
@@ -409,7 +412,8 @@ def extract_timetable(path, data_dir, output_dir=None):
         code, prog, level, cohort, span, field_work, _, no_room = key
         hours = sum(c["span"] for c, _, _ in a["cells"])
         practical = a["practical"]
-        lecturer = a["lect"].most_common(1)[0][0] if a["lect"] else ""
+        non_empty = {k: v for k, v in a["lect"].items() if k}
+        lecturer = max(non_empty, key=non_empty.get) if non_empty else (a["lect"].most_common(1)[0][0] if a["lect"] else "")
         # cells are grouped by venue kind (online / field / physical / practical),
         # so a course taught partly online, partly in the field or in the lab
         # becomes several rows

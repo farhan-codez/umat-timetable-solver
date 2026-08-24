@@ -22,8 +22,6 @@ const COURSE_BASIC_GROUPS = [
 ];
 const COURSE_ADVANCED_GROUPS = [
   { label: "Teaching hours (TPC)", cols: ["lecture_hours", "practical_hours"] },
-  { label: "Sections", cols: ["sections"] },
-  { label: "Engine", cols: ["cohort", "credits", "sessions_per_week", "min_room_size", "split"] },
 ];
 const COURSE_GROUPS = [...COURSE_BASIC_GROUPS, ...COURSE_ADVANCED_GROUPS];
 
@@ -376,10 +374,14 @@ function tableFor(kind) {
 function wire(kind) {
   $("add-" + kind).addEventListener("click", async () => {
     if (!(await requireAdmin())) return;
-    state[kind].push(defaults(kind));
+    state[kind].unshift(defaults(kind));
     tableFor(kind);
-    const firstInput = $("wrap-" + kind).querySelector("tbody input, tbody select");
-    if (firstInput) firstInput.focus();
+    const firstRow = $("wrap-" + kind).querySelector("tbody tr");
+    if (firstRow) {
+      firstRow.scrollIntoView({ behavior: "smooth", block: "nearest" });
+      const firstInput = firstRow.querySelector("input, select");
+      if (firstInput) firstInput.focus();
+    }
   });
   if (kind === "courses" && $("toggle-advanced-courses")) {
     $("toggle-advanced-courses").classList.toggle("active", showAdvancedCourses);
@@ -408,7 +410,7 @@ function wire(kind) {
         const extra = touched.length > 4 ? "\n\u2026and " + (touched.length - 4) + " more" : "";
         if (!confirm(
           "These courses are shared with another programme (the class is attached to another programme's course). " +
-          "Changing them will rebuild the class from the sections shown under Advanced fields:\n\n" +
+          "Changing them will rebuild the class from the sections derived from the Cohorts tab:\n\n" +
           names + extra + "\n\nContinue?")) return;
       }
     }
@@ -814,14 +816,15 @@ function renderDayGrid() {
   const fwCount = Object.values(fieldBySlot).reduce((a, l) => a + l.length, 0);
   const fwRows = splitOverlappingRows(fieldBySlot, nSlots);
   fwRows.forEach((rowMap, idx) => {
-    renderRow(idx === 0 ? `FIELD WORK${fwCount ? ` (${fwCount})` : ""}` : "", rowMap, "field");
+    renderRow(idx === 0 ? `FIELD WORK${fwCount ? ` (${fwCount})` : ""}` : "FIELD WORK", rowMap, "field");
   });
   rooms.forEach((r) => renderRow(roomLabel(r), byRoom[r] || {}, ""));
 
   // Online: split overlapping sessions into separate rows so each is clearly visible
+  const onlineCount = Object.values(onlineBySlot).reduce((a, l) => a + l.length, 0);
   const onlineRows = splitOverlappingRows(onlineBySlot, nSlots);
   onlineRows.forEach((rowMap, idx) => {
-    renderRow(idx === 0 ? "ONLINE (VLE)" : "", rowMap, "online");
+    renderRow(idx === 0 ? `ONLINE (VLE)${onlineCount ? ` (${onlineCount})` : ""}` : "ONLINE (VLE)", rowMap, "online");
   });
   table.appendChild(tbody);
   grid.replaceChildren(table);
@@ -836,11 +839,12 @@ function todayIdx() {
 
 async function loadTimetable() {
   try {
-    timetable = await api(withSem("/api/timetable"));
+    timetable = await api(withSem("/api/timetable") + "&_t=" + Date.now());
+    console.log("[lt] rows", timetable.rows?.length, "rooms", state.rooms?.length, "days", meta.days?.length, "slots", meta.slot_times?.length);
     summaryCards(timetable.summary);
     renderLegend();
     buildGridOptions();
-  } catch (e) { toast(e.message, true); }
+  } catch (e) { console.error("[loadTimetable]", e); toast(e.message, true); }
 }
 
 /* ---------------- solve overlay animations ---------------- */
@@ -946,6 +950,7 @@ function hideSolveOverlay() {
   stopElapsed();
   $("solve-overlay").classList.remove("show");
   $("solve-status").style.display = "";
+  ["summary", "legend", "grid"].forEach((id) => { $(id).style.display = ""; });
 }
 
 async function runSolve() {
