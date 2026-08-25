@@ -169,6 +169,26 @@ def solve(problem, time_limit=30.0, hints=None, minimize_objective=True, feasibi
             elif not soft_sections:
                 model.Add(expr <= 1)
 
+    # No same course twice per day per section
+    course_sec_sessions = {}
+    for s in sessions:
+        for sec in s.sections:
+            course_sec_sessions.setdefault((s.course.code, sec), []).append(s)
+    for (code, sec), group in course_sec_sessions.items():
+        if len(group) <= 1:
+            continue
+        for day in range(len(DAYS)):
+            day_vars = []
+            base = day * SLOTS_PER_DAY
+            for s in group:
+                for t in starts[s.id]:
+                    if day_index_of(t) != day:
+                        continue
+                    for r in allowed[s.id]:
+                        day_vars.append(z[(s.id, t, r)])
+            if day_vars:
+                model.Add(sum(day_vars) <= 1)
+
     lecturer_overlap_vars = {}
     soft_lecturer = problem.get("soft_lecturer")
     for lec in lecturers:
@@ -378,7 +398,7 @@ def _verify(assignments, problem):
     sections = problem["sections"]
     lecturers = problem["lecturers"]
     room_capacity = {r.name: r.capacity for r in problem["rooms"]}
-    issues = {"section": [], "lecturer": [], "room": [], "capacity": []}
+    issues = {"section": [], "lecturer": [], "room": [], "capacity": [], "same_day_course": []}
 
     def slots_covered(a):
         return range(a.slot, a.slot + a.session.duration)
@@ -412,6 +432,17 @@ def _verify(assignments, problem):
                 seen[u] = a.session.id
                 if cap < a.session.size:
                     issues["capacity"].append((r, a.session.id))
+
+    for sec in sections:
+        by_course_day = {}
+        for a in assignments:
+            if sec in a.session.sections:
+                d = day_index_of(a.slot)
+                key = (a.session.course.code, d)
+                by_course_day.setdefault(key, []).append(a.session.id)
+        for (code, day), sids in by_course_day.items():
+            if len(sids) > 1:
+                issues["same_day_course"].append((sec, code, day, sids))
 
     return {k: len(v) for k, v in issues.items()}
 
@@ -467,6 +498,13 @@ def repair_assignments(problem, assignments):
     for a in assignments:
         add(a)
 
+    # Track sessions originally in a real classroom — they must not be
+    # relocated back to ONLINE/Field, which would undo the fill_online_rooms
+    # conversion and create idle room slots.
+    physical_hosts = {
+        a.session.id for a in assignments if not _is_no_room(a.room)
+    }
+
     fixed = {a.session.id for a in assignments
              if getattr(a.session, "fixed_slot", None) is not None}
 
@@ -483,7 +521,13 @@ def repair_assignments(problem, assignments):
             s = a.session
             remove(a)
             found = None
-            for t, r in [(t, r) for t in _allowed_starts(s) for r in _allowed_rooms(s, rooms)]:
+            candidate_rooms = _allowed_rooms(s, rooms)
+            # Sessions that were already in a real room must not be relocated
+            # back to ONLINE/Field — that would undo fill_online_rooms work and
+            # leave idle room slots that could have been used.
+            if s.id in physical_hosts and len(candidate_rooms) > 1:
+                candidate_rooms = [r for r in candidate_rooms if not _is_no_room(r)] or candidate_rooms
+            for t, r in [(t, r) for t in _allowed_starts(s) for r in candidate_rooms]:
                 ok = True
                 for u in range(t, t + s.duration):
                     if not _is_no_room(r) and room_occ.get((r, u)):
