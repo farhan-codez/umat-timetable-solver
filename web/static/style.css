@@ -191,6 +191,13 @@ main { padding: 26px 28px 80px; max-width: 1500px; margin: 0 auto; }
   vertical-align: middle;
 }
 
+/* Cross-programme course UI */
+.col-xp { width: 180px; }
+.cross-prog-row { background: #eff6ff !important; }
+.cross-prog-row:hover { background: #e0edff !important; }
+td.col-xp { vertical-align: middle; padding: 4px 6px; }
+td.col-xp select { width: 100%; font-size: 12px; padding: 2px; }
+
 .table-wrap {
   background: var(--panel);
   border: 1px solid var(--border);
@@ -326,8 +333,9 @@ tr.edited:hover td.sticky-l { background: #fff4d6; }
   animation-delay: calc(var(--i) * .07s);
 }
 @keyframes tilefill {
-  0%, 100% { background: var(--teal-soft); transform: scale(1); }
-  45% { background: var(--teal); transform: scale(1.08); box-shadow: 0 4px 12px rgba(13, 148, 136, .4); }
+  0% { background: var(--teal); transform: scale(1.08); box-shadow: 0 4px 12px rgba(13, 148, 136, .4); }
+  50% { background: var(--teal-soft); transform: scale(1); box-shadow: none; }
+  100% { background: var(--teal); transform: scale(1.08); box-shadow: 0 4px 12px rgba(13, 148, 136, .4); }
 }
 
 /* loader 2: toppling domino blocks (uiverse.io style) */

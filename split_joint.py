@@ -24,6 +24,17 @@ def _programme_of(section_id):
     return m.group(1) if m else None
 
 
+def _code_for_prog(merged_name, prog, fallback):
+    """For a merged name like 'CE 158/PM 138', return the code matching prog."""
+    if not merged_name or "/" not in str(merged_name):
+        return fallback
+    for part in str(merged_name).split("/"):
+        m = re.search(r"([A-Z]{1,3})\s*(\d+)", part.strip())
+        if m and m.group(1).upper() == prog.upper():
+            return f"{m.group(1)} {m.group(2)}"
+    return fallback
+
+
 def _num(v):
     if v is None or (isinstance(v, float) and v != v):
         return None
@@ -66,6 +77,7 @@ def split_file(path, backup=True):
         for prog in ordered:
             child = dict(row)
             child["programme"] = prog
+            child["course_code"] = _code_for_prog(row.get("course_name", ""), prog, row["course_code"])
             child["sections"] = ",".join(sorted(grouped[prog]))
             child["size"] = _size_for(grouped[prog], cohorts)
             child["group_size"] = explicit

@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>UMaT-SRID Timetable</title>
-  <link rel="stylesheet" href="/static/style.css?v=15">
+  <link rel="stylesheet" href="/static/style.css?v=17">
 </head>
 <body>
   <header>
@@ -33,13 +33,14 @@
         <div class="toolbar">
           <input id="search-courses" type="search" placeholder="Search code / name / programme / lecturer...">
           <button id="add-courses" class="btn">+ Add course</button>
+          <button id="split-courses" class="btn ghost" title="Split cross-programme rows into per-programme rows">Split joint</button>
           <button id="toggle-advanced-courses" class="btn ghost" title="Show/hide teaching hours (TPC)">Teaching hours (TPC)</button>
           <button id="reload-courses" class="btn ghost">Reload</button>
           <button id="save-courses" class="btn primary"><span>Save changes</span><span id="badge-courses" class="badge"></span></button>
         </div>
       </div>
       <div class="table-wrap" id="wrap-courses"></div>
-        <div class="hint" id="hint-courses" hidden>Add a course: type the course name and code, pick the programme and level, name the lecturer, then mark its delivery — online (yes/no), field work (yes/no), and hours per session. One row per course: the class composition (sections) is derived automatically from the Cohorts tab for that programme and level. Courses shared with another programme (e.g. CE 158/PM 138) are marked with a "!" badge. Use "Teaching hours (TPC)" to set the lecture and practical hours — these stay the same every semester unless the department changes them.</div>
+        <div class="hint" id="hint-courses" hidden>Add a course: type the course name and code, pick the programme and level, name the lecturer, then mark its delivery — online (yes/no), field work (yes/no), and hours per session. One row per course: the class composition (sections) is derived automatically from the Cohorts tab for that programme and level. <b>Link courses</b> (e.g. CE 158 + PM 138): use the "Link with" column to select a course from a different programme — both courses share a group ID and are taught as one combined session. Sections are merged automatically.</div>
     </section>
 
     <section id="tab-rooms" class="tab">
@@ -100,7 +101,6 @@
           <div class="loader loader-grid"></div>
           <div class="loader loader-dominoes"></div>
           <div class="loader loader-dots"></div>
-          <div class="loader loader-glitch" data-text="BUILDING TIMETABLE">BUILDING TIMETABLE</div>
           <div class="loader loader-terminal">
             <div class="terminal-loader">
               <div class="terminal-header">
@@ -160,6 +160,6 @@
       </div>
     </div>
   </div>
-  <script src="/static/app.js?v=20"></script>
+  <script src="/static/app.js?v=22"></script>
 </body>
 </html>

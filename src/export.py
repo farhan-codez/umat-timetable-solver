@@ -49,16 +49,20 @@ def _section_label(a):
     """Human-readable section label for one class: 'A', 'B', 'AB' when the
     class serves all sections of one programme-level group, comma-joined
     section ids (e.g. 'CE100-B,TM100-A') for attached cross-programme classes.
-    Falls back to the course cohort column for legacy data."""
+    Falls back to the course cohort column for legacy data.
+
+    When collapsing to bare letters, prefixes the programme+level hint
+    (e.g. 'MC-AB') so cross-programme identity is never lost."""
     secs = sorted(a.session.sections)
     if not secs:
         return str(a.session.course.cohort)
     prefixes = {s.rsplit("-", 1)[0] for s in secs}
     if len(prefixes) == 1:
+        prefix = next(iter(prefixes))
         letters = sorted(s.rsplit("-", 1)[1] for s in secs)
         if letters == ["A", "B"]:
-            return "AB"
-        return ",".join(letters)
+            return f"{prefix}-AB"
+        return f"{prefix}-{','.join(letters)}"
     return ",".join(secs)
 
 
@@ -70,7 +74,7 @@ def _excel_col_for_slot(slot_in_day_):
     return 2 + slot_in_day_ + (1 if slot_in_day_ >= 6 else 0)
 
 
-def _daily_sheets(book, assignments, rooms, cohorts, existing):
+def _daily_sheets(book, assignments, rooms, cohorts, existing, semester_label="SEMESTER TIME TABLE"):
     n_slots = SLOTS_PER_DAY
     last_col = 2 + n_slots + 1  # A + 12 slots + break
     last_letter = get_column_letter(last_col)
@@ -83,7 +87,7 @@ def _daily_sheets(book, assignments, rooms, cohorts, existing):
         ws.merge_cells(f"A3:{last_letter}3")
         ws["A3"] = "SCHOOL OF RAILWAYS AND INFRASTRUCTURE DEVELOPMENT, ESSIKADO CAMPUS"
         ws.merge_cells(f"A4:{last_letter}4")
-        ws["A4"] = "SEMESTER TWO 2025/2026 TIME TABLE"
+        ws["A4"] = semester_label
 
         ws.merge_cells("A6:A8")
         ws["A6"] = "CLASSROOM/\nCAPACITY"
@@ -293,7 +297,7 @@ def _all_field(assignments, day, slot_in_day_):
     return bool(cells) and all(a.room == FIELD_WORK_ROOM for a in cells)
 
 
-def export_all(problem, result, output_dir):
+def export_all(problem, result, output_dir, semester_label=None):
     output_dir.mkdir(parents=True, exist_ok=True)
     assignments = result.assignments
     cohorts = problem["cohorts"]
@@ -303,7 +307,7 @@ def export_all(problem, result, output_dir):
     book.remove(book.active)
 
     rooms = [r for r in problem["rooms"]]
-    _daily_sheets(book, assignments, rooms, cohorts, existing)
+    _daily_sheets(book, assignments, rooms, cohorts, existing, semester_label=semester_label or "SEMESTER TIME TABLE")
 
     by_section = {sec: [] for sec in problem["sections"]}
     for a in assignments:

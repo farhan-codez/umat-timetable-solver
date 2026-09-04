@@ -204,6 +204,7 @@ function defaults(kind) {
       lecturer: "", lecture_hours: "", practical_hours: "", credits: "",
       online: "no", hours_per_session: "2", sessions_per_week: "1", min_room_size: "",
       field_work: "no", sections: "", split: "", size: "", special: false,
+      linked_course: "",
     };
   }
   if (kind === "rooms") return { name: "", capacity: "", kind: "lecture" };
@@ -269,6 +270,12 @@ function tableFor(kind) {
     if (c === "course_code") th.classList.add("sticky-l");
     hr.appendChild(th);
   });
+  if (kind === "courses") {
+    const thXp = document.createElement("th");
+    thXp.textContent = "Link with";
+    thXp.className = "col-xp";
+    hr.appendChild(thXp);
+  }
   const thA2 = document.createElement("th");
   thA2.className = "row-actions";
   hr.appendChild(thA2);
@@ -338,6 +345,46 @@ function tableFor(kind) {
       }
       tr.appendChild(td);
     });
+    if (kind === "courses") {
+      const tdLink = document.createElement("td");
+      tdLink.className = "col-xp";
+      if (r.linked_course) tr.classList.add("cross-prog-row");
+      const sel = document.createElement("select");
+      sel.title = "Link this course with another from a different programme";
+      sel.appendChild(new Option("-- none --", ""));
+      const myProg = String(r.programme || "").trim();
+      const myLv = String(r.level || "").trim();
+      const taken = new Set();
+      state.courses.forEach((other) => {
+        if (other === r) return;
+        if (other.linked_course) taken.add(other.course_code);
+      });
+      state.courses.forEach((other) => {
+        if (other === r) return;
+        if (String(other.programme || "").trim() === myProg) return;
+        if (String(other.level || "").trim() !== myLv) return;
+        if (taken.has(other.course_code) && other.course_code !== r.linked_course) return;
+        const label = `${other.course_code} (${other.programme})`;
+        sel.appendChild(new Option(label, other.course_code));
+      });
+      sel.value = r.linked_course || "";
+      sel.addEventListener("change", () => {
+        const target = sel.value;
+        const old = state[kind][i].linked_course;
+        if (old && old !== target) {
+          const oi = state.courses.findIndex((c) => c.course_code === old);
+          if (oi >= 0) state.courses[oi].linked_course = "";
+        }
+        state[kind][i].linked_course = target;
+        if (target) {
+          const ti = state.courses.findIndex((c) => c.course_code === target);
+          if (ti >= 0) state.courses[ti].linked_course = r.course_code;
+        }
+        tableFor(kind);
+      });
+      tdLink.appendChild(sel);
+      tr.appendChild(tdLink);
+    }
     const tdAct = document.createElement("td");
     tdAct.className = "row-actions";
     const dup = document.createElement("button");
@@ -392,10 +439,44 @@ function wire(kind) {
       tableFor(kind);
     });
   }
+  if (kind === "courses" && $("split-courses")) {
+    $("split-courses").addEventListener("click", async () => {
+      if (!(await requireAdmin())) return;
+      const SECTION_RE = /^([A-Z]+)(\d+)-([A-Z]+)$/;
+      const joint = state.courses.filter((r) => {
+        const raw = (r.sections || "").trim();
+        if (!raw) return false;
+        const progs = new Set();
+        raw.split(",").forEach((s) => { const m = SECTION_RE.exec(s.trim().toUpperCase()); if (m) progs.add(m[1]); });
+        return progs.size >= 2;
+      });
+      if (!joint.length) { toast("No cross-programme rows found to split."); return; }
+      const names = joint.slice(0, 5).map((r) => r.course_code).join(", ");
+      const extra = joint.length > 5 ? " and " + (joint.length - 5) + " more" : "";
+      if (!confirm(
+        "Split " + joint.length + " cross-programme row(s) into per-programme rows?\n\n" +
+        names + extra + "\n\nThis will replace the joint rows with individual programme rows sharing a group ID. " +
+        "Save afterwards to persist.")) return;
+      try {
+        const split = await apiAuthed(withSem("/api/courses/split"), {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(joint),
+        });
+        const idx = new Set(joint.map((r) => state.courses.indexOf(r)));
+        state.courses = state.courses.filter((_, i) => !idx.has(i));
+        state.courses.push(...split);
+        saved.courses = clone(state.courses);
+        tableFor("courses");
+        toast("Split " + joint.length + " row(s) into " + split.length + " per-programme rows.");
+      } catch (e) { toast(e.message, true); }
+    });
+  }
   $("reload-" + kind).addEventListener("click", async () => {
     try {
       state[kind] = await api(withSem("/api/" + kind));
       saved[kind] = clone(state[kind]);
+      if (kind === "courses") markLinkedCourses();
       tableFor(kind);
       toast("Reloaded");
     } catch (e) { toast(e.message, true); }
@@ -409,18 +490,43 @@ function wire(kind) {
         const names = touched.slice(0, 4).map((r) => r.course_code + (r.course_name ? " \u2014 " + r.course_name : "")).join("\n");
         const extra = touched.length > 4 ? "\n\u2026and " + (touched.length - 4) + " more" : "";
         if (!confirm(
-          "These courses are shared with another programme (the class is attached to another programme's course). " +
-          "Changing them will rebuild the class from the sections derived from the Cohorts tab:\n\n" +
-          names + extra + "\n\nContinue?")) return;
+          "These courses share sections with another programme (cross-programme):\n\n" +
+          names + extra + "\n\n" +
+          "Changes will rebuild the class from the Cohorts tab. " +
+          "Sections you set manually will be kept. Continue?")) return;
       }
     }
     const btn = $("save-" + kind);
     btn.disabled = true;
     try {
+      let payload = state[kind];
+      if (kind === "courses") {
+        payload = state[kind].map((r) => ({ ...r }));
+        const linkedPairs = new Set();
+        payload.forEach((r) => {
+          const target = r.linked_course;
+          if (!target) return;
+          const pairKey = [r.course_code, target].sort().join("|");
+          if (linkedPairs.has(pairKey)) return;
+          linkedPairs.add(pairKey);
+          const ti = payload.findIndex((c) => c.course_code === target);
+          if (ti < 0) return;
+          const gid = `link-${r.course_code}-${target}`.replace(/\s+/g, "-").toLowerCase();
+          r.group_id = gid;
+          payload[ti].group_id = gid;
+          const mySecs = (r.sections || sectionsForCourse(r)).split(",").filter(Boolean);
+          const theirSecs = (payload[ti].sections || sectionsForCourse(payload[ti])).split(",").filter(Boolean);
+          r.sections = [...new Set([...mySecs, ...theirSecs])].sort().join(",");
+          payload[ti].sections = r.sections;
+          r.course_name = `${r.course_code}/${target}`;
+          payload[ti].course_name = r.course_name;
+        });
+        payload.forEach((r) => { delete r.linked_course; });
+      }
       const r = await apiAuthed(withSem("/api/" + kind), {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(state[kind]),
+        body: JSON.stringify(payload),
       });
       saved[kind] = clone(state[kind]);
       tableFor(kind);
@@ -525,7 +631,10 @@ function gridRowsFor(kind, pickVal) {
   const tags = sec === "A" ? ["A", "AB"] : sec === "B" ? ["B", "AB"] : ["AB"];
   const secId = `${prog}${lvl}-${sec}`;
   return timetable.rows.filter((r) => {
-    if (String(r.programme) === prog && String(r.level) === lvl && tags.includes(r.cohort)) return true;
+    if (String(r.programme) === prog && String(r.level) === lvl) {
+      const suffix = String(r.cohort).split("-").pop() || String(r.cohort);
+      if (tags.includes(suffix)) return true;
+    }
     return String(r.cohort).split(",").includes(secId);
   });
 }
@@ -897,7 +1006,7 @@ function startSolveAnim() {
     idx = (idx + 1) % anims.length;
   };
   cycle();
-  animTimer = setInterval(cycle, 3000);
+  animTimer = setInterval(cycle, 8000);
 }
 
 function stopSolveAnim() {
@@ -975,18 +1084,19 @@ async function runSolve() {
         }
         clearInterval(poll);
         btn.disabled = false;
-        hideSolveOverlay();
         if (job.ok) {
           $("solve-status").className = "status done";
           $("solve-status").textContent =
             `Solve complete: ${job.summary.status} (objective ${job.summary.objective ?? "\u2014"})` +
             (job.summary.built_from ? ` \u00b7 Built from ${job.summary.built_from}` : "") +
             (job.note ? ` \u00b7 ${job.note}` : "");
+          $("solve-text").textContent = "Loading timetable...";
           await loadTimetable();
         } else {
           $("solve-status").className = "status error";
           $("solve-status").textContent = job.error || "Solve failed";
         }
+        hideSolveOverlay();
       } catch (e) {
         clearInterval(poll);
         btn.disabled = false;
@@ -994,7 +1104,7 @@ async function runSolve() {
         $("solve-status").className = "status error";
         $("solve-status").textContent = e.message;
       }
-    }, 2000);
+    }, 1000);
   } catch (e) {
     btn.disabled = false;
     hideSolveOverlay();
@@ -1018,7 +1128,22 @@ async function loadSemesterData() {
   ]);
   state.courses = courses; state.rooms = rooms; state.cohorts = cohorts;
   saved.courses = clone(courses); saved.rooms = clone(rooms); saved.cohorts = clone(cohorts);
+  markLinkedCourses();
   tableFor("courses"); tableFor("rooms"); tableFor("cohorts");
+}
+
+function markLinkedCourses() {
+  const gidMap = {};
+  state.courses.forEach((r, i) => {
+    const g = (r.group_id || "").trim();
+    if (g) { gidMap[g] = gidMap[g] || []; gidMap[g].push(i); }
+  });
+  Object.values(gidMap).forEach((indices) => {
+    if (indices.length !== 2) return;
+    const [a, b] = indices;
+    state.courses[a].linked_course = state.courses[b].course_code;
+    state.courses[b].linked_course = state.courses[a].course_code;
+  });
 }
 
 async function switchSemester(next) {

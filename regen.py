@@ -1,4 +1,5 @@
 import sys, json, os, subprocess, time, random, tempfile
+from copy import copy
 from pathlib import Path
 from types import SimpleNamespace
 from src.paths import PROJECT_ROOT, DATA_DIR, OUTPUT_DIR
@@ -7,6 +8,9 @@ from src.solver import load_solution_json, repair_assignments, _verify, Assignme
 from src.compact import compact, fill_online_rooms
 from src.export import export_all
 from src.pack import pack, Packer
+
+import logging
+log = logging.getLogger("umat.regen")
 
 PY = sys.executable
 WORKER = str(Path(__file__).resolve().parent / "regen_worker.py")
@@ -98,6 +102,7 @@ RUN_PHASE2 = False
 
 def run(sem):
     t0 = time.time()
+    log.info("regen start semester=%s", sem)
     problem = load_problem(str(DATA_DIR / "semesters" / sem))
     # Hard section/lecturer constraints: the pinned hints are conflict-free, so
     # phase1 (feasibility-only) already returns a conflict-free schedule and the
@@ -184,11 +189,14 @@ def run(sem):
         "room_idle_holes": room_holes(result_assign, problem),
         "built_from": f"Semester {sem[-1]}",
     }
-    export_all(problem, SimpleNamespace(assignments=result_assign), out_dir)
+    export_all(problem, SimpleNamespace(assignments=result_assign), out_dir,
+               semester_label=f"{summary['built_from']} TIME TABLE")
     with open(f"{out_dir}/solve_result.json", "w", encoding="utf-8") as fh:
         json.dump(summary, fh, indent=2)
     print(f"[{sem}] {summary}", flush=True)
-    print(f"[{sem}] done in {time.time() - t0:.0f}s", flush=True)
+    elapsed = time.time() - t0
+    print(f"[{sem}] done in {elapsed:.0f}s", flush=True)
+    log.info("regen done semester=%s elapsed=%ss status=%s", sem, round(elapsed), summary.get("status"))
 
 
 def ensure_conflict_free(problem, assignments, max_rounds=8, seed=7):
@@ -288,9 +296,11 @@ def co_teach_merge(problem, assignments, sr4=None, max_class=None):
         if best is None:
             continue
         _, b, combined = best
-        b.session.sections |= set(s.sections)
-        b.session.size = combined
-        hosts.add(b.session.id)
+        merged_session = copy(b.session)
+        merged_session.sections = set(b.session.sections) | set(s.sections)
+        merged_session.size = combined
+        b.session = merged_session
+        hosts.add(merged_session.id)
         merged_away.add(s.id)
         assignments.remove(a)
         merges += 1
@@ -341,7 +351,7 @@ def prefer_sr4(problem, assignments, sr4=None, small_cap=None, max_gap_cost=1.0)
 
 import random
 
-from src.slots import SLOTS_PER_DAY, slot_in_day
+from src.slots import N_SLOTS, SLOTS_PER_DAY, slot_in_day
 
 def _fix_break_crossing(problem, assignments):
     """Ensure no session crosses the 12:30-13:00 lunch break (slot 5->6 boundary).
@@ -374,14 +384,14 @@ def _fix_break_crossing(problem, assignments):
                 ss = aa.session
                 slots = range(aa.slot, aa.slot + ss.duration)
                 for sec in ss.sections:
-                    arr = sec_occ.setdefault(sec, [None] * (len(problem["sections"]) * SLOTS_PER_DAY))
+                    arr = sec_occ.setdefault(sec, [None] * N_SLOTS)
                     for u in slots:
                         arr[u] = ss.id
-                arr = lec_occ.setdefault(ss.course.lecturer, [None] * (len(problem["lecturers"]) * SLOTS_PER_DAY))
+                arr = lec_occ.setdefault(ss.course.lecturer, [None] * N_SLOTS)
                 for u in slots:
                     arr[u] = ss.id
                 if not _is_no_room(aa.room):
-                    arr = room_occ.setdefault(aa.room, [None] * (len(problem["rooms"]) * SLOTS_PER_DAY))
+                    arr = room_occ.setdefault(aa.room, [None] * N_SLOTS)
                     for u in slots:
                         arr[u] = ss.id
             

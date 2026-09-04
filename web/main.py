@@ -1,6 +1,9 @@
+import hashlib
 import json
+import logging
 import os
 import random
+import re
 import secrets
 import sys
 import threading
@@ -10,7 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -28,6 +31,7 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from src.helpers import _clean, _num, _truthy  # noqa: E402
 from src.slots import DAYS, SLOT_TIMES  # noqa: E402
 from src.loaders import list_semesters  # noqa: E402
 
@@ -54,6 +58,9 @@ SOLVER_CONFIG = "soft_lecturer=False;compact=2;online_in_person=1;physical_never
 
 app = FastAPI(title="UMaT-SRID Timetable")
 
+log = logging.getLogger("umat.web")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s", datefmt="%H:%M:%S")
+
 JOBS = {}
 
 _SOLVE_LOCK = threading.Lock()
@@ -61,17 +68,67 @@ _SOLVE_LOCK = threading.Lock()
 # ---- admin gate -----------------------------------------------------------
 
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "").strip()
+_hashed_mode = False  # True when security.json stores a salt+hash instead of plaintext
+
+
+def _hash_password(password, salt=None):
+    if salt is None:
+        salt = secrets.token_hex(16)
+    h = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 100_000).hex()
+    return salt, h
+
+
+def _verify_hash(password, salt, stored_hash):
+    return secrets.compare_digest(
+        hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 100_000).hex(),
+        stored_hash,
+    )
+
+
 if not ADMIN_PASSWORD:
     if SECURITY_FILE.exists():
         try:
-            ADMIN_PASSWORD = str(json.loads(SECURITY_FILE.read_text(encoding="utf-8")).get("password") or "")
+            data = json.loads(SECURITY_FILE.read_text(encoding="utf-8"))
+            stored_salt = data.get("salt")
+            stored_hash = data.get("password_hash") or data.get("password")
+            if stored_salt and stored_hash:
+                _hashed_mode = True
+            elif stored_hash:
+                ADMIN_PASSWORD = str(stored_hash)
         except Exception:
             ADMIN_PASSWORD = ""
-    if not ADMIN_PASSWORD:
-        ADMIN_PASSWORD = "admin"
-        SECURITY_FILE.write_text(json.dumps({"password": ADMIN_PASSWORD}), encoding="utf-8")
+    if not ADMIN_PASSWORD and not _hashed_mode:
+        ADMIN_PASSWORD = secrets.token_urlsafe(18)
+        salt, h = _hash_password(ADMIN_PASSWORD)
+        SECURITY_FILE.write_text(json.dumps({"salt": salt, "password_hash": h}), encoding="utf-8")
+        print(f"[umat] Generated admin password: {ADMIN_PASSWORD}", flush=True)
+        print(f"[umat] (change ADMIN_PASSWORD env var or edit {SECURITY_FILE})", flush=True)
 
 _SESSIONS = {}
+
+# ---- rate-limiting ---------------------------------------------------------
+
+_LOGIN_ATTEMPTS: dict[str, list[float]] = {}
+_LOGIN_LOCKOUT = 15 * 60   # seconds
+_LOGIN_MAX = 5             # max failures before lockout
+
+
+def _client_ip(request):
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def _check_rate(ip):
+    cutoff = time.time() - _LOGIN_LOCKOUT
+    _LOGIN_ATTEMPTS.setdefault(ip, [])
+    _LOGIN_ATTEMPTS[ip] = [t for t in _LOGIN_ATTEMPTS[ip] if t > cutoff]
+    return len(_LOGIN_ATTEMPTS[ip]) < _LOGIN_MAX
+
+
+def _record_failure(ip):
+    _LOGIN_ATTEMPTS.setdefault(ip, []).append(time.time())
 
 # Optional: push published timetables to the student app (e.g. on Vercel).
 # Set STUDENT_APP_URL (e.g. https://umat-student-app.vercel.app) and
@@ -97,9 +154,10 @@ def _pub_snapshot(sem):
     return json.loads(out.read_text(encoding="utf-8"))
 
 
-# ---- CORS: allow the other platform to read the public endpoint ------------
+# ---- CORS: allow the student app to read the public endpoint ---------------
 
-_CORS_ORIGINS = [o.strip() for o in os.environ.get("PUBLIC_ALLOW_ORIGINS", "*").split(",") if o.strip()]
+_DEFAULT_CORS = "https://umat-student-app.vercel.app"
+_CORS_ORIGINS = [o.strip() for o in os.environ.get("PUBLIC_ALLOW_ORIGINS", _DEFAULT_CORS).split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_CORS_ORIGINS,
@@ -125,33 +183,6 @@ def _cache_jobs():
     done = [j for j, s in JOBS.items() if s.get("status") == "done"]
     while len(JOBS) > 20 and done:
         JOBS.pop(done.pop(0), None)
-
-
-def _clean(value):
-    if value is None:
-        return ""
-    if isinstance(value, float):
-        if value != value:  # NaN
-            return ""
-        return int(value) if value.is_integer() else value
-    if isinstance(value, bool):
-        return "yes" if value else "no"
-    return str(value)
-
-
-def _num(value):
-    try:
-        return int(float(value))
-    except (TypeError, ValueError):
-        return 0
-
-
-def _truthy(value):
-    if value is None:
-        return False
-    if isinstance(value, bool):
-        return value
-    return str(value).strip().lower() in ("yes", "y", "1", "true", "t")
 
 
 def _course_key(r):
@@ -256,6 +287,12 @@ def _collapse_courses(rows, cohorts):
         display_code = _code_for_prog(merged_name, prog, code)
         is_merged = bool(merged_name and "/" in str(merged_name))
 
+        if is_merged:
+            gids = {str(r.get("group_id") or "").strip() for r in rs if str(r.get("group_id") or "").strip()}
+            gid = gids.pop() if len(gids) == 1 else ""
+        else:
+            gid = first("group_id")
+
         out.append({
             "course_code": display_code,
             "course_name": display_code if is_merged else merged_name, "programme": prog,
@@ -265,10 +302,37 @@ def _collapse_courses(rows, cohorts):
             "hours_per_session": mode("hours_per_session") or 2, "sessions_per_week": "",
             "min_room_size": maxnum("min_room_size"), "sections": sections, "split": split,
             "size": "", "special": bool(sections),
-            "group_id": "" if is_merged else first("group_id"),
+            "group_id": gid,
             "group_size": "" if is_merged else first("group_size"),
         })
     return out
+
+
+SECTION_RE = re.compile(r"^([A-Z]+)(\d+)-([A-Z]+)$")
+
+
+def _auto_group_id(row):
+    """Return a group_id when the sections span multiple programmes and the
+    row doesn't already carry one.  This lets the web-editor round-trip
+    cross-programme courses without requiring split_joint.py."""
+    existing = str(row.get("group_id") or "").strip()
+    if existing:
+        return existing
+    raw = str(row.get("sections") or "").strip()
+    if not raw:
+        return ""
+    secs = [s.strip().upper() for s in raw.split(",") if s.strip()]
+    progs = set()
+    for s in secs:
+        m = SECTION_RE.match(s)
+        if m:
+            progs.add(m.group(1))
+    if len(progs) < 2:
+        return ""
+    import hashlib as _hl
+    sig = "|".join(sorted(secs))
+    short = _hl.md5(sig.encode()).hexdigest()[:8]
+    return f"auto-{short}"
 
 
 def _expand_one(row):
@@ -287,6 +351,7 @@ def _expand_one(row):
     hps = 2 if hps in (None, "") else int(hps)
     online = _truthy(row.get("online"))
     field_work = _truthy(row.get("field_work"))
+    gid = _auto_group_id(row)
 
     base = {
         "course_code": code, "course_name": row.get("course_name"), "programme": prog,
@@ -295,7 +360,7 @@ def _expand_one(row):
         "online": "no", "field_work": "no", "hours_per_session": hps,
         "sessions_per_week": row.get("sessions_per_week"), "min_room_size": row.get("min_room_size"),
         "sections": row.get("sections"), "split": row.get("split"), "size": "",
-        "group_id": row.get("group_id"), "group_size": row.get("group_size"),
+        "group_id": gid, "group_size": row.get("group_size"),
     }
 
     if field_work:
@@ -472,9 +537,23 @@ class LoginRequest(BaseModel):
 
 
 @app.post("/api/auth/login")
-def login(payload: LoginRequest):
-    if payload.password != ADMIN_PASSWORD:
+def login(payload: LoginRequest, request: Request):
+    ip = _client_ip(request)
+    if not _check_rate(ip):
+        raise HTTPException(429, "Too many failed attempts. Try again later.")
+
+    password = payload.password
+    if _hashed_mode:
+        data = json.loads(SECURITY_FILE.read_text(encoding="utf-8"))
+        ok = _verify_hash(password, data["salt"], data["password_hash"])
+    else:
+        ok = secrets.compare_digest(password, ADMIN_PASSWORD)
+
+    if not ok:
+        _record_failure(ip)
         raise HTTPException(401, "Wrong password")
+
+    _LOGIN_ATTEMPTS.pop(ip, None)
     token = secrets.token_hex(16)
     _SESSIONS[token] = time.time() + 12 * 3600
     return {"token": token}
@@ -565,6 +644,41 @@ def put_courses(payload: list[dict], semester: str = "sem2", _: bool = Depends(r
     return _save(_sem_path(semester) / "courses.xlsx", rows, COURSE_COLUMNS, _validate_courses, "courses")
 
 
+@app.post("/api/courses/split")
+def split_cross_programme(payload: list[dict], semester: str = "sem2", _: bool = Depends(require_admin)):
+    """Split cross-programme rows into per-programme rows with auto-assigned group_ids."""
+    cohorts = _read_table(_sem_path(semester) / "cohorts.xlsx", COHORT_COLUMNS, key="programme")
+    cohort_map = {}
+    for c in cohorts:
+        key = f"{c['programme']}{c['level']}-{c['section']}"
+        cohort_map[key] = c
+
+    out = []
+    for row in payload:
+        code = str(row.get("course_code") or "").strip()
+        raw_secs = str(row.get("sections") or "").strip()
+        secs = [s.strip().upper() for s in raw_secs.split(",") if s.strip()] if raw_secs else []
+        progs = {}
+        for s in secs:
+            m = SECTION_RE.match(s)
+            if m:
+                progs.setdefault(m.group(1), []).append(s)
+        if len(progs) < 2:
+            out.append(row)
+            continue
+        gid = row.get("group_id") or _auto_group_id(row)
+        for prog, prog_secs in sorted(progs.items()):
+            child = dict(row)
+            child["programme"] = prog
+            child["sections"] = ",".join(sorted(prog_secs))
+            size = sum(cohort_map.get(f"{prog}{row.get('level', 100)}-{s}", {}).get("size", 0) or 0 for s in prog_secs)
+            child["size"] = size
+            child["group_id"] = gid
+            child["group_size"] = row.get("size") or ""
+            out.append(child)
+    return out
+
+
 @app.get("/api/rooms")
 def get_rooms(semester: str = "sem2"):
     return _read_table(_sem_path(semester) / "rooms.xlsx", ROOM_COLUMNS, key="name")
@@ -635,6 +749,7 @@ def _run_solve(job_id, time_limit, semester):
 
             job["progress"] = "Solving..."
             job["live"] = {"phase": "phase1", "elapsed": 0}
+            log.info("solve start semester=%s time_limit=%s", semester, time_limit)
             # Feasibility-only solve with hard section/lecturer/room constraints:
             # any returned solution is already conflict-free. A second pass with
             # an optimization objective is intentionally skipped - on this data
@@ -672,14 +787,18 @@ def _run_solve(job_id, time_limit, semester):
                 job.update(status="done", ok=False, summary=summary, note=note, progress="")
                 return
 
-            out_path = export_all(problem, result, _sem_out(semester))
+            sem_label = f"{SEMESTERS.get(semester, 'Semester')} TIME TABLE".upper()
+            out_path = export_all(problem, result, _sem_out(semester), semester_label=sem_label)
             (_sem_out(semester) / "solve_result.json").write_text(
                 json.dumps(summary, indent=2), encoding="utf-8"
             )
             job.update(status="done", ok=True, summary=summary, note=note,
                        progress="", out=str(out_path))
+            log.info("solve done semester=%s status=%s sessions=%s",
+                     semester, summary.get("status"), summary.get("sessions"))
         except Exception as e:
             job.update(status="done", ok=False, progress="", error=str(e))
+            log.exception("solve failed semester=%s", semester)
 
 
 class SolveRequest(BaseModel):
@@ -718,26 +837,7 @@ def get_timetable(semester: str = "sem2"):
     if json_path.exists():
         rows = json.loads(json_path.read_text(encoding="utf-8"))
         return {"summary": summary, "rows": rows}
-    path = _sem_out(semester) / "timetable.xlsx"
-    if not path.exists():
-        return {"summary": summary, "rows": []}
-    df = pd.read_excel(path, sheet_name=0)
-    rows = []
-    for _, r in df.iterrows():
-        rows.append({
-            "day": _clean(r.get("Day")),
-            "time": _clean(r.get("Time")),
-            "room": _clean(r.get("Room")),
-            "code": _clean(r.get("Course Code")),
-            "name": _clean(r.get("Course")),
-            "programme": _clean(r.get("Programme")),
-            "level": _clean(r.get("Level")),
-            "cohort": _clean(r.get("Cohort")),
-            "lecturer": _clean(r.get("Lecturer")),
-            "type": _clean(r.get("Type")),
-            "duration": int(r["Duration"]) if _clean(r.get("Duration")) else 1,
-        })
-    return {"summary": summary, "rows": rows}
+    return {"summary": summary, "rows": [], "note": "No timetable generated yet. Run the solver first."}
 
 
 @app.get("/api/timetable.xlsx")
