@@ -28,7 +28,7 @@ def _truthy(value):
 
 
 def _blank(value):
-    return value is None or (isinstance(value, float) and math.isnan(value))
+    return value is None or (isinstance(value, float) and math.isnan(value)) or (isinstance(value, str) and value.strip() == "")
 
 
 def _clean_text(value):
@@ -420,6 +420,16 @@ def load_courses(path, cohorts, max_capacity=120, split_combined_above=SPLIT_COM
         else:
             logical.append(r)
 
+    online_codes = set()
+    for row in logical:
+        if _truthy(row.get("online", "no")):
+            online_codes.add(_clean_text(row["course_code"]))
+
+    for row in logical:
+        code = _clean_text(row["course_code"])
+        if code in online_codes:
+            row["online"] = "yes"
+
     sessions = []
     seq = 0
     for row in logical:
@@ -489,32 +499,49 @@ def load_courses(path, cohorts, max_capacity=120, split_combined_above=SPLIT_COM
         if spw < 1:
             raise ValueError(f"{code}: sessions_per_week must be >= 1")
 
-        # Auto-split: a physical course taught to both A and B of the same
+        # Auto-split: a course taught to both A and B of the same
         # programme+level is split into two separate classes (one per section)
         # when the combined class is too large to teach as one. Each split class
         # keeps the full teaching hours. Cross-programme combinations (e.g.
-        # "CE100-B,TM100-A") and online / field-work courses are never split.
-        # The optional "split" column overrides the size-based default:
-        #   blank  -> auto (split only when combined size > SPLIT_COMBINED_ABOVE)
+        # "CE100-B,TM100-A") and field-work courses are never split.
+        # Online courses follow the same auto-split logic (split when > threshold)
+        # so they can occupy 80-cap rooms instead of requiring a 120-cap auditorium.
+        # The optional "split" column overrides the size-based default for physical courses:
+        #   blank  -> auto (split when combined size > SPLIT_COMBINED_ABOVE)
         #   "no"   -> always keep combined (e.g. an auditorium lecture)
         #   "yes"  -> always split into one class per section
         split_flag = _clean_text(row.get("split", ""))
-        auto_split = split_flag not in ("no", "yes")
-        force_split = split_flag == "yes"
+        if online:
+            # Online courses: respect "no" (keep combined). For "yes" or blank, auto-split by size.
+            if split_flag == "no":
+                auto_split = False
+                force_split = False
+            else:
+                auto_split = True
+                force_split = split_flag == "yes"
+        else:
+            auto_split = split_flag not in ("no", "yes")
+            force_split = split_flag == "yes"
         target = f"{programme}{level}-"
         groups = [(cohort, sections, size)]
+        split_groups = None
         if (
-            not online
-            and not field_work
+            not field_work
             and set(sections) == {target + "A", target + "B"}
             and (force_split or (auto_split and size > split_combined_above))
         ):
+            split_groups = f"{code}-{target}AB"
             groups = [
-                ("A", {target + "A"}, cohorts[target + "A"].size),
-                ("B", {target + "B"}, cohorts[target + "B"].size),
+                ("A", {target + "A"}, cohorts[target + "A"].size, split_groups),
+                ("B", {target + "B"}, cohorts[target + "B"].size, split_groups),
             ]
 
-        for g_cohort, g_sections, g_size in groups:
+        for g in groups:
+            if len(g) == 4:
+                g_cohort, g_sections, g_size, split_groups = g
+            else:
+                g_cohort, g_sections, g_size = g
+                split_groups = None
             seq += 1
             course = Course(
                 code=code,
@@ -538,6 +565,7 @@ def load_courses(path, cohorts, max_capacity=120, split_combined_above=SPLIT_COM
                     course=course, index=i, size=g_size,
                     sections=g_sections,
                     duration=duration, online=online, field_work=field_work,
+                    split_group=split_groups if len(groups) == 2 else None,
                 ))
 
     return sessions
@@ -549,7 +577,7 @@ def load_settings(data_dir):
     if path.exists():
         with open(path, encoding="utf-8") as fh:
             raw = json.load(fh)
-        for key in ("room_oversize", "evening", "cohort_gap", "lecturer_gap", "early_utilization", "lecturer_overlap", "section_overlap", "lab_room", "online"):
+        for key in ("room_oversize", "evening", "cohort_gap", "lecturer_gap", "early_utilization", "early_penalty_late_level", "lecturer_overlap", "section_overlap", "lab_room", "online", "room_idle"):
             if key in raw.get("weights", {}):
                 setattr(weights, key, int(raw["weights"][key]))
     return weights

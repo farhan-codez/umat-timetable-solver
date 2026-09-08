@@ -4,8 +4,11 @@ from pathlib import Path
 from types import SimpleNamespace
 from src.paths import PROJECT_ROOT, DATA_DIR, OUTPUT_DIR
 from src.loaders import load_problem, list_semesters
-from src.solver import load_solution_json, repair_assignments, _verify, Assignment
+from src.solver import load_solution_json, repair_assignments, _verify, Assignment, ONLINE_ROOM, FIELD_WORK_ROOM, _allowed_starts
+from src.slots import DAYS, SLOTS_PER_DAY, N_SLOTS, day_index_of, slot_in_day
 from src.compact import compact, fill_online_rooms
+from src.pack import pack, Packer
+from src.solver import _verify
 from src.export import export_all
 from src.pack import pack, Packer
 
@@ -175,6 +178,7 @@ def run(sem):
     result_assign = list(result_assign)
     result_assign = postprocess(problem, result_assign, sem)
     checks = _verify(result_assign, problem)
+    print(f"[{sem}] final verify: " + "; ".join(f"{k}={v}" for k, v in checks.items()), flush=True)
 
     out_dir = OUTPUT_DIR / sem
     summary = {
@@ -182,6 +186,8 @@ def run(sem):
         "objective": round(obj) if obj not in (None, float("inf")) else None,
         "conflicts": {k: checks[k] for k in ("section", "room", "capacity")},
         "lecturer_overlaps": checks.get("lecturer", 0),
+        "same_day_course": checks.get("same_day_course", 0),
+        "paired_session": checks.get("paired_session", 0),
         "sessions": len(sessions),
         "sections": len(problem["sections"]),
         "lecturers": len(problem["lecturers"]),
@@ -442,17 +448,17 @@ def postprocess(problem, assignments, sem="?"):
     result = clone_assign(assignments)
     repair_assignments(problem, result)
     print(f"[{sem}] compact ...", flush=True)
-    compact(problem, result, time_budget=120)
-    fill_online_rooms(problem, result, max_gap_cost=2, time_budget=60)
-    compact(problem, result, time_budget=60)
+    compact(problem, result, time_budget=30)
+    fill_online_rooms(problem, result, time_budget=15)
+    compact(problem, result, time_budget=15)
 
     print(f"[{sem}] pack (keep best of trials) ...", flush=True)
     best_assign, best_holes = None, None
-    for i in range(4):
+    for i in range(2):
         cand = clone_assign(result)
         rng = random.Random(random.randint(1, 2**31 - 1))
-        for _ in range(3):
-            pack(problem, cand, time_budget=60, rng=rng)
+        for _ in range(2):
+            pack(problem, cand, time_budget=15, rng=rng)
             Packer(problem, cand, rng=rng).fill_holes(max_depth=4)
         holes = room_holes(cand, problem)
         print(f"[{sem}] pack trial {i + 1}: room idle holes={holes}", flush=True)
@@ -463,7 +469,7 @@ def postprocess(problem, assignments, sem="?"):
     print(f"[{sem}] rebalance room-day loads ...", flush=True)
     holes_before = room_holes(result, problem)
     from src.rebalance import rebalance
-    rebalance(problem, result, min_load=8, time_budget=240)
+    rebalance(problem, result, min_load=8, time_budget=60)
     holes_after = room_holes(result, problem)
     if holes_after > holes_before:
         print(f"[{sem}] WARNING rebalance added holes: {holes_before} -> {holes_after}", flush=True)
@@ -477,7 +483,7 @@ def postprocess(problem, assignments, sem="?"):
     print(f"[{sem}] small classes merged into same-course partners: {merged}", flush=True)
 
     print(f"[{sem}] convert online classes into free rooms ...", flush=True)
-    inperson = fill_online_rooms(problem, result, time_budget=120)
+    inperson = fill_online_rooms(problem, result, time_budget=30)
 
     # Final safeguard: fix any break-crossing sessions
     print(f"[{sem}] fixing break-crossing sessions ...", flush=True)
@@ -500,11 +506,208 @@ def postprocess(problem, assignments, sem="?"):
     # that were empty at certain times (e.g. SR 13 at 06:30) stay idle while
     # compatible online sessions sit unused.
     print(f"[{sem}] final online-to-room sweep ...", flush=True)
-    final_online = fill_online_rooms(problem, result, time_budget=120)
+    final_online = fill_online_rooms(problem, result, time_budget=60)
     if final_online:
         print(f"[{sem}] final sweep converted {final_online} online sessions to rooms", flush=True)
     else:
         print(f"[{sem}] no more online sessions to place", flush=True)
+
+    # Aggressive fill: chain-shift placement of REMAINING fully-online courses
+    # (after consistency checks, all mixed courses are resolved to all-physical or all-online)
+    print(f"[{sem}] aggressive fill (chain shifts) ...", flush=True)
+    packer = Packer(problem, result)
+    agg, _ = packer.aggressive_fill(problem, result, time_budget=180, max_depth=3, max_restarts=6)
+    if agg:
+        print(f"[{sem}] aggressive fill placed {agg} online sessions", flush=True)
+    else:
+        print(f"[{sem}] aggressive fill found no placements", flush=True)
+
+    # Repair any conflicts introduced by aggressive fill
+    print(f"[{sem}] conflict repair after aggressive fill ...", flush=True)
+    result, remaining = ensure_conflict_free(problem, result)
+    if any(remaining[k] for k in ("section", "lecturer", "room")):
+        print(f"[{sem}] WARNING: could not fully repair {remaining}", flush=True)
+    else:
+        print(f"[{sem}] conflict-free after aggressive fill (section/lecturer/room = 0)", flush=True)
+
+    # Consistency fixes AFTER aggressive fill: ensure no mixed physical/online sessions remain
+    # Aggressive fill may place some sessions of a course physically, leaving others ONLINE.
+    # This pass resolves those mixed courses.
+    # Paired session consistency fix
+    print(f"[{sem}] paired session consistency check (post-aggressive) ...", flush=True)
+    fixed = 0
+    split_groups = {}
+    for a in result:
+        sg = getattr(a.session, 'split_group', None)
+        if sg:
+            split_groups.setdefault(sg, []).append(a)
+    
+    room_occ = {}
+    for r in problem["rooms"]:
+        room_occ[r.name] = [None] * N_SLOTS
+    for a in result:
+        if a.room not in (ONLINE_ROOM, FIELD_WORK_ROOM):
+            t = a.slot
+            for u in range(t, t + a.session.duration):
+                room_occ[a.room][u] = a.session.id
+    
+    sec_occ = {}
+    lec_occ = {}
+    for a in result:
+        for sec in a.session.sections:
+            sec_occ.setdefault(sec, [None] * N_SLOTS)
+            if a.room not in (ONLINE_ROOM, FIELD_WORK_ROOM):
+                t = a.slot
+                for u in range(t, t + a.session.duration):
+                    sec_occ[sec][u] = a.session.id
+        if a.session.course.lecturer:
+            lec_occ.setdefault(a.session.course.lecturer, [None] * N_SLOTS)
+            if a.room not in (ONLINE_ROOM, FIELD_WORK_ROOM):
+                t = a.slot
+                for u in range(t, t + a.session.duration):
+                    lec_occ[a.session.course.lecturer][u] = a.session.id
+    
+    for sg, paired in split_groups.items():
+        physical = [a for a in paired if a.room not in (ONLINE_ROOM, FIELD_WORK_ROOM)]
+        online = [a for a in paired if a.room == ONLINE_ROOM]
+        
+        if not physical or not online:
+            continue
+        
+        for online_a in online:
+            session = online_a.session
+            placed = False
+            need = max(session.size, session.course.min_capacity)
+            wanted_kind = "lab" if session.course.practical_hours > 0 else "lecture"
+            candidates = [r for r in problem["rooms"] if r.kind == wanted_kind and r.capacity >= need]
+            if not candidates:
+                candidates = [r for r in problem["rooms"] if r.capacity >= need]
+            elif wanted_kind == "lab":
+                candidates = candidates + [r for r in problem["rooms"] if r.kind != "lab" and r.capacity >= need]
+            
+            for r in candidates:
+                rn = r.name
+                if rn in (ONLINE_ROOM, FIELD_WORK_ROOM):
+                    continue
+                arr = room_occ[rn]
+                for t in range(N_SLOTS):
+                    free = True
+                    for u in range(t, t + session.duration):
+                        if u >= N_SLOTS or arr[u] is not None:
+                            free = False
+                            break
+                    if not free:
+                        continue
+                    sec_conflict = False
+                    for sec in session.sections:
+                        sec_arr = sec_occ.get(sec, [None] * N_SLOTS)
+                        for u in range(t, t + session.duration):
+                            if u < N_SLOTS and sec_arr[u] is not None:
+                                sec_conflict = True
+                                break
+                        if sec_conflict:
+                            break
+                    if sec_conflict:
+                        continue
+                    lec_conflict = False
+                    if session.course.lecturer:
+                        lec_arr = lec_occ.get(session.course.lecturer, [None] * N_SLOTS)
+                        for u in range(t, t + session.duration):
+                            if u < N_SLOTS and lec_arr[u] is not None:
+                                lec_conflict = True
+                                break
+                    if lec_conflict:
+                        continue
+                    if day_index_of(t) == len(DAYS) - 1 and (not session.online or not session.course.code.startswith("RT")):
+                        continue
+                    s = slot_in_day(t)
+                    if s + session.duration > SLOTS_PER_DAY:
+                        continue
+                    online_a.room = rn
+                    online_a.slot = t
+                    for u in range(t, t + session.duration):
+                        arr[u] = session.id
+                        for sec in session.sections:
+                            sec_occ[sec][u] = session.id
+                        if session.course.lecturer:
+                            lec_occ[session.course.lecturer][u] = session.id
+                    placed = True
+                    break
+                if placed:
+                    break
+            
+            if not placed:
+                for pa in physical:
+                    pa.room = ONLINE_ROOM
+                online_a.room = ONLINE_ROOM
+                fixed += 1
+                break
+    
+    if fixed:
+        print(f"[{sem}] fixed {fixed} mixed paired sessions (moved to ONLINE)", flush=True)
+    else:
+        print(f"[{sem}] all paired sessions consistent", flush=True)
+
+    # Repair any conflicts introduced by consistency passes
+    print(f"[{sem}] conflict repair after consistency ...", flush=True)
+    result, remaining = ensure_conflict_free(problem, result)
+    if any(remaining[k] for k in ("section", "lecturer", "room")):
+        print(f"[{sem}] WARNING: could not fully repair {remaining}", flush=True)
+    else:
+        print(f"[{sem}] conflict-free after consistency (section/lecturer/room = 0)", flush=True)
+
+    # Sequential fill: after consistency pass freed cells, try placing each
+    # online session (or A/B split pair together) into a free cell. A course
+    # may end up with some sessions in person and some ONLINE - that is allowed;
+    # only split A/B pairs must stay uniform (both physical or both ONLINE).
+    print(f"[{sem}] sequential session fill (tail) ...", flush=True)
+    from src.online_placement import place_courses_sequential
+    placed_sessions, result = place_courses_sequential(problem, result)
+    if placed_sessions:
+        print(f"[{sem}] sequential fill placed {placed_sessions} sessions", flush=True)
+    else:
+        print(f"[{sem}] sequential fill found no placements", flush=True)
+
+    # Repair any conflicts introduced by sequential fill
+    print(f"[{sem}] conflict repair after sequential fill ...", flush=True)
+    result, remaining = ensure_conflict_free(problem, result)
+    if any(remaining[k] for k in ("section", "lecturer", "room")):
+        print(f"[{sem}] WARNING: could not fully repair {remaining}", flush=True)
+    else:
+        print(f"[{sem}] conflict-free after sequential fill (section/lecturer/room = 0)", flush=True)
+
+    # Paired session consistency backstop. Runs AFTER the last repair because
+    # the greedy repair can move one member of an A/B split pair to ONLINE and
+    # split it. Moving both members to ONLINE keeps their slots, so their
+    # section/lecturer occupancy is unchanged and no new conflict appears.
+    print(f"[{sem}] paired session consistency check (post-repair) ...", flush=True)
+    fixed = 0
+    split_groups = {}
+    for a in result:
+        sg = getattr(a.session, 'split_group', None)
+        if sg:
+            split_groups.setdefault(sg, []).append(a)
+
+    for sg, paired in split_groups.items():
+        physical = [a for a in paired if a.room not in (ONLINE_ROOM, FIELD_WORK_ROOM)]
+        online = [a for a in paired if a.room == ONLINE_ROOM]
+        if physical and online:
+            for a in paired:
+                a.room = ONLINE_ROOM
+            fixed += 1
+
+    if fixed:
+        print(f"[{sem}] fixed {fixed} mixed paired sessions (moved to ONLINE)", flush=True)
+    else:
+        print(f"[{sem}] all paired sessions consistent", flush=True)
+
+    # One final guard: in case a pair flip collided with another session,
+    # repair once more and only ship a clean timetable.
+    result, remaining = ensure_conflict_free(problem, result)
+    if any(remaining[k] for k in ("section", "lecturer", "room")):
+        print(f"[{sem}] WARNING: could not fully repair {remaining}", flush=True)
+    else:
+        print(f"[{sem}] final state conflict-free (section/lecturer/room = 0)", flush=True)
 
     return result
 

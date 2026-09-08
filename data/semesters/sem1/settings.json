@@ -1,18 +1,20 @@
 {
     "weights":  {
                     "room_oversize":  2,
-                    "evening":  4,
-                    "cohort_gap":  30,
-                    "lecturer_gap":  15,
+                    "evening":  1,
+                    "cohort_gap":  0,
+                    "lecturer_gap":  0,
                     "early_utilization":  8,
+                    "early_penalty_late_level": 2,
                     "lecturer_overlap":  8,
                     "section_overlap":  60,
                     "lab_room":  2,
-                    "online":  1
+                    "online":  100,
+                    "room_idle":  10
                 },
     "split_combined_above":  90,
     "sr4_room":  "",
     "small_class_cap":  0,
     "max_class_cap":  0,
-    "phase1_time_limit":  900
+    "phase1_time_limit":  1800
 }

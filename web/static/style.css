@@ -236,6 +236,8 @@ table.grid-table td input {
   background: transparent;
 }
 table.grid-table td input:focus { outline: 2px solid var(--teal); background: #f8fffe; }
+table.grid-table td select:disabled,
+table.grid-table td input:read-only { cursor: default; opacity: 1; }
 tbody tr { transition: background .1s; }
 tbody tr:hover td { background: #f0fbfa; }
 tr.edited td { background: #fff9e8; }
@@ -663,9 +665,6 @@ tr.edited:hover td.sticky-l { background: #fff4d6; }
 .day-grid td.room.field-row { color: #14532d; background: #bbf7d0; font-weight: 700; }
 .day-grid th.break { background: #ffedd5; color: #b45309; }
 .day-grid td.break { background: #fff7ed; }
-.day-grid th.offpeak { background: #eef1f2; color: #9aa3a8; font-weight: 600; }
-.day-grid td.offpeak { background: #f4f6f7; }
-.day-grid td.offpeak .block { opacity: .75; }
 .day-grid td .block { min-height: 100%; }
 .day-grid td.stacked { padding: 2px; }
 .cell-stack { display: flex; flex-direction: column; gap: 2px; }

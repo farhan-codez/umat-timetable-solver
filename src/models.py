@@ -51,6 +51,7 @@ class Session:
     duration: int = 2  # hours (number of 1-hour slots this class occupies)
     online: bool = False
     field_work: bool = False
+    split_group: str | None = None  # links A and B from the same combined course
 
     @property
     def id(self):

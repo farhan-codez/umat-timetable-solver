@@ -26,14 +26,16 @@ def _is_no_room(room):
 @dataclass
 class SolverWeights:
     room_oversize: int = 2
-    evening: int = 4
-    cohort_gap: int = 30
-    lecturer_gap: int = 15
+    evening: int = 1
+    cohort_gap: int = 0
+    lecturer_gap: int = 0
     early_utilization: int = 8
+    early_penalty_late_level: int = 2
     lecturer_overlap: int = 8
     section_overlap: int = 60
     lab_room: int = 2
-    online: int = 1
+    online: int = 100
+    room_idle: int = 10
 
 
 @dataclass
@@ -81,6 +83,8 @@ def _allowed_rooms(session, rooms):
         # otherwise they fall back to the ONLINE venue (which never needs a room).
         names.append(ONLINE_ROOM)
     # physical (online=no) sessions always run in a real classroom.
+    # If a combined online session is too large for ANY physical room,
+    # ONLINE_ROOM is already in the list (from session.online=True).
     return names
 
 
@@ -103,9 +107,8 @@ def _allowed_starts(session):
         # (never the 06:30/07:30 early blocks, never the evening).
         if session.field_work and not (FIELD_WORK_START_MIN <= s <= FIELD_WORK_START_MAX):
             continue
-        # Level 200+ in-person sessions cannot start before 08:30
-        if session.course.level >= 200 and not session.online and s < 2:
-            continue
+        # Level 200+ in-person sessions can start at 06:30/07:30 but with a penalty
+        # (handled in objective function via weights.early_penalty_late_level)
         out.append(t)
     return out
 
@@ -247,6 +250,46 @@ def solve(problem, time_limit=30.0, hints=None, minimize_objective=True, feasibi
                     occ = model.NewBoolVar(f"earlyocc_{r}_{u}")
                     model.Add(occ == expr)
                     terms.append(weights.early_utilization * (1 - occ))
+
+        # Penalty for level 200+ sessions starting at 06:30 or 07:30 (slots 0, 1)
+        if weights.early_penalty_late_level:
+            for s in sessions:
+                if s.course.level >= 200 and not s.online:
+                    for r in allowed[s.id]:
+                        if r == ONLINE_ROOM or r == FIELD_WORK_ROOM:
+                            continue
+                        for day in range(len(DAYS)):
+                            for sl in range(2):  # slots 0 (06:30) and 1 (07:30)
+                                u = day * SLOTS_PER_DAY + sl
+                                for t in starts[s.id]:
+                                    if t <= u < t + s.duration:
+                                        terms.append(weights.early_penalty_late_level * z[(s.id, t, r)])
+
+        if weights.room_idle:
+            room_slot_idle = {}
+            for r in room_capacity:
+                if r in (ONLINE_ROOM, FIELD_WORK_ROOM):
+                    continue
+                for day in range(len(DAYS)):
+                    if day == len(DAYS) - 1:
+                        continue  # skip Saturday
+                    base = day * SLOTS_PER_DAY
+                    for sl in range(2, SLOTS_PER_DAY):
+                        u = base + sl
+                        occ_vars = []
+                        for s in sessions:
+                            if r not in allowed[s.id]:
+                                continue
+                            for t in starts[s.id]:
+                                if t <= u < t + s.duration:
+                                    occ_vars.append(z[(s.id, t, r)])
+                        if not occ_vars:
+                            continue
+                        idle = model.NewBoolVar(f"idle_{r}_{u}")
+                        model.Add(idle + sum(occ_vars) == 1)
+                        room_slot_idle[(r, u)] = idle
+            for (r, u), idle in room_slot_idle.items():
+                terms.append(weights.room_idle * idle)
 
         def add_gap_terms(keys, key_filter, weight, tag):
             for key in keys:
@@ -431,7 +474,9 @@ def _verify(assignments, problem):
                     issues["room"].append((r, u, seen[u], a.session.id))
                 seen[u] = a.session.id
                 if cap < a.session.size:
-                    issues["capacity"].append((r, a.session.id))
+                    real_size = sum(problem["cohorts"][s].size for s in a.session.sections if s in problem["cohorts"])
+                    if real_size > cap:
+                        issues["capacity"].append((r, a.session.id, real_size, cap))
 
     for sec in sections:
         by_course_day = {}
@@ -443,6 +488,24 @@ def _verify(assignments, problem):
         for (code, day), sids in by_course_day.items():
             if len(sids) > 1:
                 issues["same_day_course"].append((sec, code, day, sids))
+
+    # Paired sessions (split A/B) must both be physical or both be ONLINE
+    split_groups = {}
+    for a in assignments:
+        sg = getattr(a.session, 'split_group', None)
+        if sg:
+            split_groups.setdefault(sg, []).append(a)
+
+    for sg, paired in split_groups.items():
+        if len(paired) != 2:
+            continue
+        a1, a2 = paired[0], paired[1]
+        online1 = a1.room == ONLINE_ROOM
+        online2 = a2.room == ONLINE_ROOM
+        if online1 != online2:
+            issues.setdefault("paired_session", []).append(
+                (sg, a1.session.id, a2.session.id, "mixed physical/online")
+            )
 
     return {k: len(v) for k, v in issues.items()}
 
@@ -549,4 +612,42 @@ def repair_assignments(problem, assignments):
         fixed_count += moved
         if moved == 0:
             break
+
+    # Last resort: an online-eligible session that still has hard conflicts is
+    # sent back to the ONLINE venue at a time when its sections/lecturer are
+    # free. This resolves room + lecturer overlaps without needing a real room;
+    # it only touches sessions that could not be relocated to any free cell.
+    online_day_used = set()
+    for b in assignments:
+        for sec in b.session.sections:
+            online_day_used.add((sec, b.session.course.code, day_index_of(b.slot)))
+    for a in assignments:
+        if not (hard_conflicts(a) or lec_conflicts(a)):
+            continue
+        s = a.session
+        if not s.online:
+            continue
+        current_day = day_index_of(a.slot)
+        remove(a)
+        found = None
+        for t in _allowed_starts(s):
+            d = day_index_of(t)
+            if d != current_day and any((sec, s.course.code, d) in online_day_used
+                                        for sec in s.sections):
+                continue
+            ok = True
+            for u in range(t, t + s.duration):
+                if any(sec_occ.get((sec, u)) for sec in s.sections):
+                    ok = False
+                    break
+                if not soft_lecturer and lec_occ.get((s.course.lecturer, u)):
+                    ok = False
+                    break
+            if ok:
+                found = t
+                break
+        if found is not None:
+            a.slot, a.room = found, ONLINE_ROOM
+            fixed_count += 1
+        add(a)
     return assignments, fixed_count

@@ -61,6 +61,15 @@ app = FastAPI(title="UMaT-SRID Timetable")
 log = logging.getLogger("umat.web")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s", datefmt="%H:%M:%S")
 
+MAX_BODY_BYTES = 2 * 1024 * 1024  # 2 MB
+
+@app.middleware("http")
+async def limit_body_size(request: Request, call_next):
+    cl = request.headers.get("content-length")
+    if cl and int(cl) > MAX_BODY_BYTES:
+        raise HTTPException(413, "Request body too large")
+    return await call_next(request)
+
 JOBS = {}
 
 _SOLVE_LOCK = threading.Lock()
@@ -101,8 +110,9 @@ if not ADMIN_PASSWORD:
         ADMIN_PASSWORD = secrets.token_urlsafe(18)
         salt, h = _hash_password(ADMIN_PASSWORD)
         SECURITY_FILE.write_text(json.dumps({"salt": salt, "password_hash": h}), encoding="utf-8")
-        print(f"[umat] Generated admin password: {ADMIN_PASSWORD}", flush=True)
-        print(f"[umat] (change ADMIN_PASSWORD env var or edit {SECURITY_FILE})", flush=True)
+        _cred_file = ROOT / ".admin_credentials"
+        _cred_file.write_text(f"Admin password: {ADMIN_PASSWORD}\n", encoding="utf-8")
+        log.info("Generated admin password written to %s", _cred_file)
 
 _SESSIONS = {}
 
@@ -115,7 +125,7 @@ _LOGIN_MAX = 5             # max failures before lockout
 
 def _client_ip(request):
     forwarded = request.headers.get("x-forwarded-for")
-    if forwarded:
+    if forwarded and TRUSTED_PROXIES:
         return forwarded.split(",")[0].strip()
     return request.client.host if request.client else "unknown"
 
@@ -135,6 +145,12 @@ def _record_failure(ip):
 # STUDENT_APP_PUBLISH_SECRET (must match the app's TIMETABLE_PUBLISH_SECRET).
 STUDENT_APP_URL = os.environ.get("STUDENT_APP_URL", "").strip().rstrip("/")
 STUDENT_APP_PUBLISH_SECRET = os.environ.get("STUDENT_APP_PUBLISH_SECRET", "").strip()
+
+# Comma-separated list of proxy IPs to trust for X-Forwarded-For.
+# Leave empty (default) to ignore the header and use request.client.host directly.
+TRUSTED_PROXIES = {
+    ip.strip() for ip in os.environ.get("TRUSTED_PROXIES", "").split(",") if ip.strip()
+}
 
 
 def require_admin(authorization: str = Header(None)):
@@ -301,7 +317,7 @@ def _collapse_courses(rows, cohorts):
             "credits": maxnum("credits"), "online": online, "field_work": field_work,
             "hours_per_session": mode("hours_per_session") or 2, "sessions_per_week": "",
             "min_room_size": maxnum("min_room_size"), "sections": sections, "split": split,
-            "size": "", "special": bool(sections),
+            "size": "", "special": len({SECTION_RE.match(s).group(1) for s in union if SECTION_RE.match(s)}) > 1,
             "group_id": gid,
             "group_size": "" if is_merged else first("group_size"),
         })
@@ -437,6 +453,7 @@ def _read_table(path, columns, key=None):
 
 
 def _write_table(path, rows, columns):
+    import tempfile
     data = []
     for row in rows:
         out = {}
@@ -448,7 +465,15 @@ def _write_table(path, rows, columns):
                 out[c] = v
         data.append(out)
     df = pd.DataFrame(data, columns=columns)
-    df.to_excel(path, index=False)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+    try:
+        os.close(fd)
+        df.to_excel(tmp, index=False)
+        os.replace(tmp, path)
+    except Exception:
+        try: os.unlink(tmp)
+        except OSError: pass
+        raise
     return len(df)
 
 
@@ -483,6 +508,29 @@ def _validate_courses(rows):
             hps_i = _int_value(hps, f"{code}: hours_per_session")
             if not 1 <= hps_i <= 12:
                 raise ValueError(f"{code}: hours_per_session must be 1..12")
+
+
+def _validate_cohort_existence(rows, cohorts):
+    """Check that every course's sections have matching rows in cohorts.xlsx."""
+    valid = set()
+    for c in cohorts:
+        p = str(c.get("programme") or "").strip()
+        l = str(c.get("level") or "").strip()
+        s = str(c.get("section") or "").strip().upper()
+        if p and l and s:
+            valid.add(f"{p}{l}-{s}")
+    for row in rows:
+        code = str(row.get("course_code") or "").strip()
+        raw = str(row.get("sections") or "").strip()
+        if not raw:
+            continue
+        for s in raw.split(","):
+            s = s.strip().upper()
+            if s and s not in valid:
+                raise ValueError(
+                    f"{code}: section {s!r} has no matching cohort. "
+                    f"Add {s} to cohorts.xlsx first."
+                )
 
 
 def _validate_rooms(rows):
@@ -641,7 +689,9 @@ def put_courses(payload: list[dict], semester: str = "sem2", _: bool = Depends(r
     existing = _read_table(_sem_path(semester) / "courses.xlsx", COURSE_COLUMNS, key="course_code")
     cohorts = _read_table(_sem_path(semester) / "cohorts.xlsx", COHORT_COLUMNS, key="programme")
     rows = _expand_courses(payload, existing, cohorts)
-    return _save(_sem_path(semester) / "courses.xlsx", rows, COURSE_COLUMNS, _validate_courses, "courses")
+    _validate_cohort_existence(rows, cohorts)
+    with _SOLVE_LOCK:
+        return _save(_sem_path(semester) / "courses.xlsx", rows, COURSE_COLUMNS, _validate_courses, "courses")
 
 
 @app.post("/api/courses/split")
@@ -686,7 +736,8 @@ def get_rooms(semester: str = "sem2"):
 
 @app.put("/api/rooms")
 def put_rooms(payload: list[dict], semester: str = "sem2", _: bool = Depends(require_admin)):
-    return _save(_sem_path(semester) / "rooms.xlsx", payload, ROOM_COLUMNS, _validate_rooms, "rooms")
+    with _SOLVE_LOCK:
+        return _save(_sem_path(semester) / "rooms.xlsx", payload, ROOM_COLUMNS, _validate_rooms, "rooms")
 
 
 @app.get("/api/cohorts")
@@ -696,7 +747,8 @@ def get_cohorts(semester: str = "sem2"):
 
 @app.put("/api/cohorts")
 def put_cohorts(payload: list[dict], semester: str = "sem2", _: bool = Depends(require_admin)):
-    return _save(_sem_path(semester) / "cohorts.xlsx", payload, COHORT_COLUMNS, _validate_cohorts, "cohorts")
+    with _SOLVE_LOCK:
+        return _save(_sem_path(semester) / "cohorts.xlsx", payload, COHORT_COLUMNS, _validate_cohorts, "cohorts")
 
 
 @app.get("/api/lecturers")
@@ -717,7 +769,8 @@ def get_lecturers():
 
 @app.put("/api/lecturers")
 def put_lecturers(payload: list[dict], _: bool = Depends(require_admin)):
-    return _save(LECTURERS_FILE, payload, LECTURER_COLUMNS, _validate_lecturers, "lecturers")
+    with _SOLVE_LOCK:
+        return _save(LECTURERS_FILE, payload, LECTURER_COLUMNS, _validate_lecturers, "lecturers")
 
 
 def _build_problem(sem):

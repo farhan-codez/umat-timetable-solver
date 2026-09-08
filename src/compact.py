@@ -200,6 +200,9 @@ def fill_online_rooms(problem, assignments, max_gap_cost=None, time_budget=60):
     sec_occ = {}
     lec_occ = {}
     room_occ = {}
+    for r in problem["rooms"]:
+        if not _is_no_room(r.name):
+            room_occ[r.name] = [None] * N_SLOTS
     for a in assignments:
         s = a.session
         slots = range(a.slot, a.slot + s.duration)
@@ -255,7 +258,7 @@ def fill_online_rooms(problem, assignments, max_gap_cost=None, time_budget=60):
                     continue
                 rn = None
                 for r in allowed[s.id]:
-                    if r == ONLINE_ROOM:
+                    if r == ONLINE_ROOM or r == FIELD_WORK_ROOM:
                         continue
                     arr = room_occ[r]
                     free = True

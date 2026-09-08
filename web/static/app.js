@@ -56,6 +56,7 @@ async function apiAuthed(path, options) {
       authToken = "";
       sessionStorage.removeItem("auth");
       updateLoginUI();
+      tableFor("courses"); tableFor("rooms"); tableFor("cohorts"); tableFor("lecturers");
       openLogin();
     }
     throw e;
@@ -78,6 +79,7 @@ async function refreshAuth() {
     toast("Session expired - please log in again", true);
   }
   updateLoginUI();
+  tableFor("courses"); tableFor("rooms"); tableFor("cohorts"); tableFor("lecturers");
 }
 
 function openLogin() {
@@ -102,6 +104,7 @@ async function doLogin() {
     sessionStorage.setItem("auth", r.token);
     updateLoginUI();
     closeLogin();
+    tableFor("courses"); tableFor("rooms"); tableFor("cohorts"); tableFor("lecturers");
     toast("Logged in");
   } catch (e) { toast(e.message, true); }
 }
@@ -110,6 +113,7 @@ function doLogout() {
   authToken = "";
   sessionStorage.removeItem("auth");
   updateLoginUI();
+  tableFor("courses"); tableFor("rooms"); tableFor("cohorts"); tableFor("lecturers");
   toast("Logged out");
 }
 
@@ -289,7 +293,42 @@ function tableFor(kind) {
     cols.forEach((c) => {
       const td = document.createElement("td");
       if (c === "course_code") td.classList.add("sticky-l");
-      const set = (v) => {
+      if (!authToken) {
+        if (COURSE_SELECTS[c]) {
+          const sel = document.createElement("select");
+          const val = c === "sections"
+            ? (state[kind][i].sections || sectionsForCourse(r) || "auto")
+            : String(r[c] ?? "");
+          sel.appendChild(new Option(val, val));
+          sel.value = val;
+          sel.disabled = true;
+          sel.tabIndex = -1;
+          td.appendChild(sel);
+        } else if (c === "sections" && !r.special) {
+          const span = document.createElement("span");
+          span.className = "derived";
+          const secs = state[kind][i].sections || sectionsForCourse(r);
+          span.textContent = secs || "auto";
+          td.appendChild(span);
+        } else {
+          const input = document.createElement("input");
+          input.type = "text";
+          input.value = r[c] ?? "";
+          input.readOnly = true;
+          input.tabIndex = -1;
+          td.appendChild(input);
+        }
+        if (c === "course_code" && r.special) {
+          const badge = document.createElement("span");
+          badge.className = "badge-warn";
+          badge.textContent = "!";
+          badge.title = "Shared with another programme";
+          td.appendChild(badge);
+        }
+        tr.appendChild(td);
+        return;
+      }
+      const set = async (v) => {
         state[kind][i][c] = v;
         tr.classList.toggle("edited", saved[kind][i] && rowChanged(kind, r, saved[kind][i]));
         updateBadge(kind);
@@ -368,6 +407,7 @@ function tableFor(kind) {
         sel.appendChild(new Option(label, other.course_code));
       });
       sel.value = r.linked_course || "";
+      if (!authToken) { sel.disabled = true; sel.tabIndex = -1; }
       sel.addEventListener("change", () => {
         const target = sel.value;
         const old = state[kind][i].linked_course;
@@ -390,7 +430,8 @@ function tableFor(kind) {
     const dup = document.createElement("button");
     dup.title = "Duplicate row";
     dup.textContent = "⧉";
-    dup.addEventListener("click", () => {
+    dup.addEventListener("click", async () => {
+      if (!(await requireAdmin())) return;
       state[kind].splice(i + 1, 0, clone(r));
       tableFor(kind);
     });
@@ -398,10 +439,12 @@ function tableFor(kind) {
     del.className = "del";
     del.title = "Delete row";
     del.textContent = "\u2715";
-    del.addEventListener("click", () => {
+    del.addEventListener("click", async () => {
+      if (!(await requireAdmin())) return;
       state[kind].splice(i, 1);
       tableFor(kind);
     });
+    if (!authToken) { dup.style.display = "none"; del.style.display = "none"; }
     tdAct.append(dup, del);
     tr.appendChild(tdAct);
     tbody.appendChild(tr);
@@ -473,6 +516,7 @@ function wire(kind) {
     });
   }
   $("reload-" + kind).addEventListener("click", async () => {
+    if (hasUnsavedChanges() && !confirm("You have unsaved changes. Reload anyway?")) return;
     try {
       state[kind] = await api(withSem("/api/" + kind));
       saved[kind] = clone(state[kind]);
@@ -828,7 +872,6 @@ function renderDayGrid() {
   hA.rowSpan = 2;
   hA.textContent = "Room";
   hr1.appendChild(hA);
-  const OFFPEAK = new Set([0, 1, 10, 11]);
   for (let si = 0; si < nSlots; si++) {
     const th = document.createElement("th");
     if (si === 5) {
@@ -837,7 +880,6 @@ function renderDayGrid() {
     } else {
       th.textContent = `Period ${si + 1}`;
     }
-    if (OFFPEAK.has(si)) th.className = "offpeak";
     hr1.appendChild(th);
   }
   thead.appendChild(hr1);
@@ -855,7 +897,6 @@ function renderDayGrid() {
     } else {
       const th = document.createElement("th");
       th.textContent = meta.slot_times[si];
-      if (OFFPEAK.has(si)) th.className = "offpeak";
       hr2.appendChild(th);
     }
   }
@@ -884,7 +925,6 @@ function renderDayGrid() {
         td.className = "break";
         td.textContent = "";
       }
-      if (ci === 1 || ci === 2 || ci === 12 || ci === 13) td.classList.add("offpeak");
       cells[ci] = td;
     }
     const skipCols = new Set();
@@ -1148,6 +1188,10 @@ function markLinkedCourses() {
 
 async function switchSemester(next) {
   if (next === semester) return;
+  if (hasUnsavedChanges() && !confirm("You have unsaved changes. Switch semester anyway?")) {
+    $("semester").value = semester;
+    return;
+  }
   semester = next;
   $("download-xlsx").href = withSem("/api/timetable.xlsx");
   $("publish-result").hidden = true;
@@ -1231,5 +1275,18 @@ $("publish").addEventListener("click", async () => {
 });
 
 $("semester").addEventListener("change", (e) => switchSemester(e.target.value));
+
+function hasUnsavedChanges() {
+  for (const kind of ["courses", "rooms", "cohorts", "lecturers"]) {
+    if (state[kind].length !== saved[kind].length) return true;
+    for (let i = 0; i < state[kind].length; i++) {
+      if (!saved[kind][i] || rowChanged(kind, state[kind][i], saved[kind][i])) return true;
+    }
+  }
+  return false;
+}
+window.addEventListener("beforeunload", (e) => {
+  if (hasUnsavedChanges()) { e.preventDefault(); e.returnValue = ""; }
+});
 
 init();

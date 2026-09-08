@@ -1,7 +1,7 @@
 import time
 
 from .slots import N_SLOTS, SLOTS_PER_DAY, day_index_of
-from .solver import _allowed_rooms, _allowed_starts, _is_no_room
+from .solver import _allowed_rooms, _allowed_starts, _is_no_room, ONLINE_ROOM, FIELD_WORK_ROOM, _verify
 
 ROOM_W = 2.0
 COHORT_W = 1.0
@@ -332,7 +332,7 @@ class Packer:
                 active.add(a.session.id)
         return active
 
-    def fill_holes(self, max_depth=4, max_fill=8):
+    def fill_holes(self, max_depth=4, max_fill=20):
         """Targeted chain search: for each remaining room hole, try to fill it
         by relocating sessions; if a session's departure opens a new hole, recurse
         until a departure closes a block edge. Returns holes filled."""
@@ -384,6 +384,241 @@ class Packer:
             moved.discard(s.id)
             self._remove(s)
             self._place(s, old_t, old_r)
+        return False
+
+    def _blockers_at(self, s, t, r):
+        """Return set of session ids occupying (t..t+dur) for s at room r, sections, or lecturer.
+        Excludes s itself and ONLINE/FIELD_WORK rooms (they don't occupy room_occ)."""
+        dur = s.duration
+        new = range(t, t + dur)
+        blockers = set()
+        # Room blockers
+        if not _is_no_room(r):
+            arr = self.room_occ.get(r, [])
+            for u in new:
+                v = arr[u]
+                if v is not None:
+                    blockers.add(v)
+        # Section blockers
+        for sec in s.sections:
+            arr = self.sec_occ.get(sec, [])
+            for u in new:
+                v = arr[u]
+                if v is not None:
+                    blockers.add(v)
+        # Lecturer blockers
+        lec = s.course.lecturer
+        if lec:
+            arr = self.lec_occ.get(lec, [])
+            for u in new:
+                v = arr[u]
+                if v is not None:
+                    blockers.add(v)
+        blockers.discard(s.id)
+        return blockers
+
+    def _candidate_homes(self, s, exclude_t=None, exclude_r=None):
+        """Yield (t, r) pairs sorted by _score_relocate (best first)."""
+        cands = []
+        for t in self.starts[s.id]:
+            if exclude_t is not None and t == exclude_t:
+                continue
+            for r in self.allowed[s.id]:
+                if r == ONLINE_ROOM or r == FIELD_WORK_ROOM:
+                    continue
+                if exclude_r is not None and r == exclude_r:
+                    continue
+                if self._free(s, t, r):
+                    d = self._score_relocate(s, t, r)
+                    cands.append((d, t, r))
+        cands.sort(key=lambda x: x[0])
+        for d, t, r in cands:
+            yield t, r
+
+    def aggressive_fill(self, problem, assignments, time_budget=180.0, max_depth=3, max_restarts=6):
+        """Multi-restart depth-1 chain placement for online sessions.
+        Only displaces blockers that have a completely free alternative cell (no recursion).
+        Uses _verify for comprehensive conflict checking after each chain commit.
+        Returns (placements_made, best_assignments_dict)."""
+        import time
+        deadline = time.time() + time_budget
+        best_placed = -1
+        best_assign = None
+        online_sessions = [s for s in self.sessions
+                           if s.online and self.assign[s.id].room == ONLINE_ROOM]
+        if not online_sessions:
+            return 0, None
+        # Order by constrainedness (fewest candidate homes first)
+        def constrainedness(s):
+            cnt = 0
+            for t in self.starts[s.id]:
+                for r in self.allowed[s.id]:
+                    if r == ONLINE_ROOM or r == FIELD_WORK_ROOM:
+                        continue
+                    if self._free(s, t, r):
+                        cnt += 1
+            return cnt
+        for restart in range(max_restarts):
+            if time.time() > deadline:
+                break
+            # Rebuild occupancy arrays from current assignments (fresh per restart)
+            self.sec_occ = {}
+            self.lec_occ = {}
+            self.room_occ = {}
+            for a in self.assign.values():
+                s = a.session
+                slots = range(a.slot, a.slot + s.duration)
+                for sec in s.sections:
+                    arr = self.sec_occ.setdefault(sec, [None] * N_SLOTS)
+                    for u in slots:
+                        arr[u] = s.id
+                arr = self.lec_occ.setdefault(s.course.lecturer, [None] * N_SLOTS)
+                for u in slots:
+                    arr[u] = s.id
+                if not _is_no_room(a.room):
+                    arr = self.room_occ.setdefault(a.room, [None] * N_SLOTS)
+                    for u in slots:
+                        arr[u] = s.id
+            # Shuffle and sort by constrainedness
+            ordered = sorted(online_sessions, key=lambda s: (constrainedness(s), self.rng.random()))
+            placed = 0
+            for s in ordered:
+                a = self.assign[s.id]
+                if a.room != ONLINE_ROOM:
+                    continue  # already placed by earlier online session in this restart
+                # Try direct placement first (no chain)
+                direct_placed = False
+                for t in self.starts[s.id]:
+                    for r in self.allowed[s.id]:
+                        if r == ONLINE_ROOM or r == FIELD_WORK_ROOM:
+                            continue
+                        if self._free(s, t, r):
+                            self._remove(s)
+                            self._place(s, t, r)
+                            placed += 1
+                            direct_placed = True
+                            break
+                    if direct_placed:
+                        break
+                if direct_placed:
+                    continue
+                # Depth-1 chain: find a cell where all blockers have free alternative homes
+                best_chain = None
+                for t in self.starts[s.id]:
+                    for r in self.allowed[s.id]:
+                        if r == ONLINE_ROOM or r == FIELD_WORK_ROOM:
+                            continue
+                        if t == a.slot and r == a.room:
+                            continue
+                        blockers = self._blockers_at(s, t, r)
+                        if not blockers:
+                            continue
+                        # Only consider physical blockers
+                        physical_blockers = [bid for bid in blockers
+                                             if not self._is_online_or_field(bid)]
+                        if not physical_blockers:
+                            continue
+                        # Try to find free alternative homes for ALL blockers
+                        blocker_homes = {}
+                        moved = set()
+                        ok = True
+                        for bid in physical_blockers:
+                            if bid in moved:
+                                ok = False
+                                break
+                            blocker_session = next((ses for ses in self.sessions if ses.id == bid), None)
+                            if blocker_session is None or getattr(blocker_session, "fixed_slot", None) is not None:
+                                ok = False
+                                break
+                            # Find a completely free home for this blocker
+                            found = False
+                            for bt, br in self._candidate_homes(blocker_session):
+                                if (bt, br) == (self.assign[bid].slot, self.assign[bid].room):
+                                    continue
+                                # Check this home doesn't conflict with other blockers' new homes
+                                conflict = False
+                                for other_bid, (ot, or_) in blocker_homes.items():
+                                    if self._sessions_overlap(blocker_session, bt, br, other_bid):
+                                        conflict = True
+                                        break
+                                if conflict:
+                                    continue
+                                blocker_homes[bid] = (bt, br)
+                                moved.add(bid)
+                                found = True
+                                break
+                            if not found:
+                                ok = False
+                                break
+                        if ok and blocker_homes:
+                            best_chain = blocker_homes
+                            break
+                    if best_chain:
+                        break
+                if best_chain:
+                    # Save original positions for rollback (blockers + online session)
+                    original = {bid: (self.assign[bid].slot, self.assign[bid].room) for bid in best_chain}
+                    original[s.id] = (self.assign[s.id].slot, self.assign[s.id].room)
+                    # Commit: move blockers to their new homes
+                    for bid, (bt, br) in best_chain.items():
+                        blocker = next(ses for ses in self.sessions if ses.id == bid)
+                        self._remove(blocker)
+                        self._place(blocker, bt, br)
+                    # Place online session
+                    self._remove(s)
+                    self._place(s, t, r)
+                    # Full conflict check using proven _verify
+                    checks = _verify(assignments, problem)
+                    conflict = any(checks[k] for k in checks if checks[k])
+                    if conflict:
+                        # Rollback
+                        for bid in best_chain:
+                            blocker = next(ses for ses in self.sessions if ses.id == bid)
+                            old_slot, old_room = original[bid]
+                            self._remove(blocker)
+                            self._place(blocker, old_slot, old_room)
+                        self._remove(s)
+                        self._place(s, original[s.id][0], original[s.id][1])
+                    else:
+                        placed += 1
+            if placed > best_placed:
+                best_placed = placed
+                best_assign = {sid: (a.slot, a.room) for sid, a in self.assign.items()}
+        if best_assign:
+            for sid, (slot, room) in best_assign.items():
+                a = self.assign[sid]
+                a.slot = slot
+                a.room = room
+        return best_placed, best_assign
+
+    def _is_online_or_field(self, session_id):
+        s = next((ses for ses in self.sessions if ses.id == session_id), None)
+        return s is not None and (s.online or s.field_work)
+
+    def _sessions_overlap(self, s1, t1, r1, s2_id):
+        """Check if s1 at (t1,r1) conflicts with s2 at its assigned slot/room."""
+        if s2_id not in self.assign:
+            return False
+        s2 = self.assign[s2_id].session
+        a2 = self.assign[s2_id]
+        if r1 != ONLINE_ROOM and r1 != FIELD_WORK_ROOM and a2.room == r1:
+            # Same room - check time overlap
+            s1_slots = set(range(t1, t1 + s1.duration))
+            s2_slots = set(range(a2.slot, a2.slot + s2.duration))
+            if s1_slots & s2_slots:
+                return True
+        # Check section overlap
+        if s1.sections & s2.sections:
+            s1_slots = set(range(t1, t1 + s1.duration))
+            s2_slots = set(range(a2.slot, a2.slot + s2.duration))
+            if s1_slots & s2_slots:
+                return True
+        # Check lecturer overlap
+        if s1.course.lecturer and s1.course.lecturer == s2.course.lecturer:
+            s1_slots = set(range(t1, t1 + s1.duration))
+            s2_slots = set(range(a2.slot, a2.slot + s2.duration))
+            if s1_slots & s2_slots:
+                return True
         return False
 
     def run(self, time_budget=180.0, max_rounds=400):
