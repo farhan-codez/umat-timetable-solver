@@ -70,6 +70,35 @@ def _tier(capacity):
     return 3
 
 
+def _is_split_form(session):
+    """A split-form session is one half (A or B) of a course taught as two
+    physically separate groups. Its timetable row only makes sense as part of
+    a uniform A/B unit; it must never ship as an ONLINE row on its own."""
+    return getattr(session, "split_group", None) is not None
+
+
+def _is_combined_form(session):
+    """The combined form: both A and B sections taught together in one class
+    (the school's 'AB' row). This is the only form allowed to use the ONLINE
+    venue under the 'online = strictly combined' rule."""
+    if _is_split_form(session):
+        return False
+    if not session.sections:
+        return False
+    return any(sec[-1:] in ("A", "B") for sec in session.sections)
+
+
+def unit_base(session):
+    """Key that glues a combined AB course row to its A/B split halves: the
+    split rows share split_group 'CE 451-CE400-AB', and the combined row of the
+    same course derives the identical base from code + programme + level."""
+    sg = getattr(session, "split_group", None)
+    if sg is not None:
+        return sg[:-2] if sg.endswith("AB") else sg
+    c = session.course
+    return f"{c.code}-{c.programme}{c.level}-"
+
+
 def _allowed_rooms(session, rooms):
     need = max(session.size, session.course.min_capacity)
     wanted_kind = "lab" if session.course.practical_hours > 0 else "lecture"
@@ -512,7 +541,7 @@ def _verify(assignments, problem):
             if len(sids) > 1:
                 issues["same_day_course"].append((sec, code, day, sids))
 
-    # Paired sessions (split A/B) must both be physical or both be ONLINE
+    # Paired sessions (split A/B) must both be physical or both be ONLINE.
     split_groups = {}
     for a in assignments:
         sg = getattr(a.session, 'split_group', None)
@@ -520,15 +549,25 @@ def _verify(assignments, problem):
             split_groups.setdefault(sg, []).append(a)
 
     for sg, paired in split_groups.items():
-        if len(paired) != 2:
-            continue
-        a1, a2 = paired[0], paired[1]
-        online1 = a1.room == ONLINE_ROOM
-        online2 = a2.room == ONLINE_ROOM
-        if online1 != online2:
+        online = [a for a in paired if a.room == ONLINE_ROOM]
+        if online and len(online) != len(paired):
             issues.setdefault("paired_session", []).append(
-                (sg, a1.session.id, a2.session.id, "mixed physical/online")
+                (sg, tuple(a.session.id for a in paired), "mixed physical/online")
             )
+
+    # Split A/B rows are never allowed to ship as ONLINE (online is strictly the
+    # combined form). A course may also legitimately have BOTH an in-person row
+    # and an online combined row (the school's dual campus/VLE rows - e.g. an
+    # `online=yes, split=no` row next to an `online=no` row for the same
+    # course), so only split-form rows that landed in the ONLINE venue count as
+    # violations. This is what keeps ES 376 / EL 162 style courses from
+    # shipping as A/B-split rows in the ONLINE venue.
+    split_online_units = set()
+    for a in assignments:
+        if a.room == ONLINE_ROOM and _is_split_form(a.session):
+            split_online_units.add(unit_base(a.session))
+    if split_online_units:
+        issues["mixed_course"] = sorted(split_online_units)
 
     return {k: len(v) for k, v in issues.items()}
 
@@ -648,7 +687,7 @@ def repair_assignments(problem, assignments):
         if not (hard_conflicts(a) or lec_conflicts(a)):
             continue
         s = a.session
-        if not s.online:
+        if not s.online or _is_split_form(s):
             continue
         current_day = day_index_of(a.slot)
         remove(a)
@@ -903,8 +942,11 @@ def fix_same_day_course(problem, assignments, max_rounds=6, seed=7):
                     break
             # ONLINE fallback only resolves hard duplicate-course days, and the
             # daily cap too only when explicitly enabled - it costs in-person.
+            # Split A/B sessions are never ONLINE fallback candidates: online is
+            # strictly the combined form, so a half (A-only / B-only) row must
+            # stay in a real room or be reported as left_put.
             allow_online = "dup" in reasons or (cap_online and "cap" in reasons)
-            if planned is None and a.session.online and allow_online:
+            if planned is None and a.session.online and allow_online and not _is_split_form(a.session):
                 for t in _allowed_starts(a.session):
                     d = day_index_of(t)
                     if d == cur_day or not target_ok(a, d) or not sec_lec_free(a, t):

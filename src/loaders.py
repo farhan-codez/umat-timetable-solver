@@ -16,6 +16,11 @@ SETTINGS_FILE = "settings.json"
 
 ONLINE_TRUE = {"yes", "y", "1", "true", "online"}
 
+# A course may ship an in-person row AND an online (VLE) twin row for the same
+# sections. When True, any online row for a code forces every row of that code
+# to online=yes (the old behaviour which orphaned the in-person classrooms).
+PROPAGATE_ONLINE_TO_DUPLICATE_ROWS = False
+
 # A course taught to both sections A and B of the same programme+level is kept
 # as ONE combined class while the combined size is at or below this many
 # students; above it the loader splits it into two separate classes (one per
@@ -420,15 +425,17 @@ def load_courses(path, cohorts, max_capacity=120, split_combined_above=SPLIT_COM
         else:
             logical.append(r)
 
-    online_codes = set()
-    for row in logical:
-        if _truthy(row.get("online", "no")):
-            online_codes.add(_clean_text(row["course_code"]))
-
-    for row in logical:
-        code = _clean_text(row["course_code"])
-        if code in online_codes:
-            row["online"] = "yes"
+    # A course may legitimately ship TWO rows: an in-person offering and its
+    # online (VLE) twin (e.g. `online=no` + `online=yes, split=no` for the
+    # same sections). Previously any `online=yes` row made the WHOLE course
+    # online=yes, so in-person twin rows (like ES 376 / CV 351's split rows)
+    # were stamped online and their classrooms were never used. Only the row
+    # that is actually marked online is the online offering now.
+    #
+    # Set PROPAGATE_ONLINE_TO_DUPLICATE_ROWS = True to restore the old
+    # whole-course-online behaviour.
+    if not PROPAGATE_ONLINE_TO_DUPLICATE_ROWS:
+        pass
 
     sessions = []
     seq = 0

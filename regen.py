@@ -4,7 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from src.paths import PROJECT_ROOT, DATA_DIR, OUTPUT_DIR
 from src.loaders import load_problem, list_semesters
-from src.solver import load_solution_json, repair_assignments, _verify, Assignment, ONLINE_ROOM, FIELD_WORK_ROOM, _allowed_starts, fix_same_day_course
+from src.solver import load_solution_json, repair_assignments, _verify, Assignment, ONLINE_ROOM, FIELD_WORK_ROOM, _allowed_starts, _allowed_rooms, _is_split_form, _is_combined_form, unit_base, fix_same_day_course
 from src.slots import DAYS, SLOTS_PER_DAY, N_SLOTS, day_index_of, slot_in_day
 from src.compact import compact, fill_online_rooms
 from src.pack import pack, Packer
@@ -187,6 +187,9 @@ def run(sem):
     checks = _verify(result_assign, problem)
     print(f"[{sem}] final verify: " + "; ".join(f"{k}={v}" for k, v in checks.items()), flush=True)
 
+    used_cells, total_cells = room_cell_usage(result_assign, problem["rooms"])
+    util_pct = round(used_cells / total_cells * 100, 1)
+
     out_dir = OUTPUT_DIR / sem
     summary = {
         "status": "FEASIBLE" if status in (None, "NO SOLUTION") else status,
@@ -200,6 +203,9 @@ def run(sem):
         "lecturers": len(problem["lecturers"]),
         "rooms": len(problem["rooms"]),
         "room_idle_holes": room_holes(result_assign, problem),
+        "room_utilisation_pct": util_pct,
+        "room_cells_used": used_cells,
+        "room_cells_total": total_cells,
         "built_from": f"Semester {sem[-1]}",
     }
     export_all(problem, SimpleNamespace(assignments=result_assign), out_dir,
@@ -445,6 +451,259 @@ def _fix_break_crossing(problem, assignments):
                 fixed += 1
     return fixed
 
+
+def _room_candidates(session, rooms):
+    """Real rooms a session could physically attend, best-fit first. Mirrors
+    _allowed_rooms but never returns ONLINE / FIELD WORK."""
+    need = max(session.size, session.course.min_capacity)
+    wanted = "lab" if session.course.practical_hours > 0 else "lecture"
+    candidates = [r for r in rooms if r.kind == wanted and r.capacity >= need]
+    if not candidates:
+        candidates = [r for r in rooms if r.capacity >= need]
+    elif wanted == "lab":
+        candidates = candidates + [r for r in rooms if r.kind != "lab" and r.capacity >= need]
+    candidates = [r for r in candidates if r.name not in (ONLINE_ROOM, FIELD_WORK_ROOM)]
+    return sorted(candidates, key=lambda r: (r.capacity, r.name))
+
+
+def _build_occupancy(assignments, n_slots):
+    room_occ = {}
+    sec_occ = {}
+    lec_occ = {}
+    for a in assignments:
+        if a.room in (ONLINE_ROOM, FIELD_WORK_ROOM):
+            continue
+        for u in range(a.slot, a.slot + a.session.duration):
+            room_occ.setdefault(a.room, [None] * n_slots)[u] = a.session.id
+            for sec in a.session.sections:
+                sec_occ.setdefault(sec, [None] * n_slots)[u] = a.session.id
+            if a.session.course.lecturer:
+                lec_occ.setdefault(a.session.course.lecturer, [None] * n_slots)[u] = a.session.id
+    return room_occ, sec_occ, lec_occ
+
+
+def _place_online_in_room(problem, assignments, a, room_occ, sec_occ, lec_occ):
+    """Try to seat one ONLINE assignment into a real room. Occupancy-aware
+    (room / section / lecturer free), honours _allowed_starts (Saturday is only
+    for RT online) and TIER_STRICT (no 120-seat halls for small/mid classes
+    unless the room fits). Mutates occupancy arrays on success. Returns bool."""
+    from src.solver import _tier, TIER_STRICT
+    s = a.session
+    dur = s.duration
+    if TIER_STRICT and _tier(max(s.size, s.course.min_capacity)) <= 2:
+        candidates = [r for r in _room_candidates(s, problem["rooms"]) if _tier(r.capacity) <= 2]
+    else:
+        candidates = _room_candidates(s, problem["rooms"])
+    for r in candidates:
+        rn = r.name
+        for t in _allowed_starts(s):
+            cover = range(t, t + dur)
+            if any(room_occ.get(rn, [None] * N_SLOTS)[u] is not None for u in cover):
+                continue
+            if any(sec_occ.get(sec) and sec_occ[sec][u] is not None
+                   for sec in s.sections for u in cover):
+                continue
+            if s.course.lecturer:
+                lec = lec_occ.get(s.course.lecturer)
+                if lec is not None and any(lec[u] is not None for u in cover):
+                    continue
+            a.room = rn
+            a.slot = t
+            for u in cover:
+                room_occ.setdefault(rn, [None] * N_SLOTS)[u] = s.id
+                for sec in s.sections:
+                    sec_occ.setdefault(sec, [None] * N_SLOTS)[u] = s.id
+                if s.course.lecturer:
+                    lec_occ.setdefault(s.course.lecturer, [None] * N_SLOTS)[u] = s.id
+            return True
+    return False
+
+
+def _illegal_online(assignments):
+    """ONLINE rows that the school's rules forbid: split-form (A/B half)
+    sessions. Online is strictly the combined form, so an A-only / B-only row
+    may never ship in the ONLINE venue - even when the rest of the unit is
+    online. Combined-AB online rows alongside an in-person row are the school's
+    dual campus/VLE design and are NOT violations."""
+    return [a for a in assignments if a.room == ONLINE_ROOM and _is_split_form(a.session)]
+
+
+def _seat_one_round(problem, assignments):
+    """One occupancy-aware pass seating every ONLINE row that must be in
+    person (split-form halves and ONLINE members of mixed units). Split forms
+    are processed first so they win the free cells over legitimately-online
+    rows. Returns the number seated. Never moves other sessions, never falls
+    back to ONLINE."""
+    room_occ, sec_occ, lec_occ = _build_occupancy(assignments, N_SLOTS)
+    targets = _illegal_online(assignments)
+    targets.sort(key=lambda a: 0 if _is_split_form(a.session) else 1)
+    done = 0
+    for a in targets:
+        if _place_online_in_room(problem, assignments, a, room_occ, sec_occ, lec_occ):
+            done += 1
+    return done
+
+
+def fix_mixed_courses(problem, assignments, max_rounds=8):
+    """Final guard: seat every ONLINE row that must be in person until no more
+    progress. Online is strictly the combined form, so the only ONLINE rows
+    that survive are combined-AB courses and single-group course rows (VLE
+    whole-cohort lectures). Residuals (split sessions that could not fit any
+    room) are reported, never silently shipped as ONLINE. Returns a dict of
+    counters."""
+    seated = 0
+    for _ in range(max_rounds):
+        done = _seat_one_round(problem, assignments)
+        seated += done
+        if done == 0:
+            break
+    left = _illegal_online(assignments)
+    left_names = sorted(a.session.id for a in left)
+    return {
+        "seated": seated,
+        "left": len(left),
+        "left_names": left_names[:40],
+    }
+
+
+def _same_course_day_count(assignments, session, day):
+    """Physical sessions of this course already booked on `day` (the VLE ONLINE
+    row itself is not a classroom, so it never counts against the daily cap)."""
+    return sum(
+        1 for a in assignments
+        if a.session.course.code == session.course.code
+        and day_index_of(a.slot) == day
+        and a.room not in (ONLINE_ROOM, FIELD_WORK_ROOM)
+    )
+
+
+def _find_seat(problem, assignments, session, room_occ, sec_occ, lec_occ, daily_cap,
+               strict_section_day=False):
+    """Non-mutating best-fit seat search feeding the utilisation sweep.
+    Returns (room_name, slot) or None. Honours the size-tier rule (TIER_STRICT:
+    small/mid must not take a 120-seat hall), _allowed_starts (lunch break,
+    Saturday = RT online only, field-work window), the same-course daily cap,
+    and the live room/section/lecturer occupancy. With strict_section_day, skips
+    any day where a section of this course already has a physical class of the
+    same course (so splits/halves never double-book a section in one day)."""
+    from src.solver import _tier, TIER_STRICT
+    need = max(session.size, session.course.min_capacity)
+    if TIER_STRICT and _tier(need) <= 2:
+        rooms = [r for r in _room_candidates(session, problem["rooms"]) if _tier(r.capacity) <= 2]
+    else:
+        rooms = _room_candidates(session, problem["rooms"])
+    dur = session.duration
+    for t in _allowed_starts(session):
+        d = day_index_of(t)
+        if daily_cap and _same_course_day_count(assignments, session, d) >= daily_cap:
+            continue
+        if strict_section_day:
+            blocked = False
+            for a in assignments:
+                if (a.room not in (ONLINE_ROOM, FIELD_WORK_ROOM)
+                        and day_index_of(a.slot) == d
+                        and a.session.course.code == session.course.code
+                        and a.session.sections.intersection(session.sections)):
+                    blocked = True
+                    break
+            if blocked:
+                continue
+        cover = range(t, t + dur)
+        for r in rooms:
+            rn = r.name
+            if any(room_occ.get(rn, [None] * N_SLOTS)[u] is not None for u in cover):
+                continue
+            if any((sec_occ.get(sec) or [None] * N_SLOTS)[u] is not None
+                   for sec in session.sections for u in cover):
+                continue
+            if session.course.lecturer:
+                lec = lec_occ.get(session.course.lecturer) or [None] * N_SLOTS
+                if any(lec[u] is not None for u in cover):
+                    continue
+            return rn, t
+    return None
+
+
+def _commit_seat(assignments, session, seat, room_occ, sec_occ, lec_occ):
+    """Place a (probably synthetic) session and update the occupancy arrays."""
+    rn, t = seat
+    assignments.append(Assignment(session, t, rn))
+    for u in range(t, t + session.duration):
+        room_occ.setdefault(rn, [None] * N_SLOTS)[u] = session.id
+        for sec in session.sections:
+            sec_occ.setdefault(sec, [None] * N_SLOTS)[u] = session.id
+        if session.course.lecturer:
+            lec_occ.setdefault(session.course.lecturer, [None] * N_SLOTS)[u] = session.id
+
+
+def max_utilisation_sweep(problem, assignments):
+    """Raise % utilisation by seating the remaining combined-ONLINE rows in free
+    room cells. Whole-seat a row when any compatible cell is free; big rows
+    (no free 120-cap hall) are split into physical A/B half-sessions that fit
+    the 80-cap rooms, keeping the VLE combined row ONLINE (parallel-stream
+    teaching, the school's dual pattern). Unseatable rows stay ONLINE. Never
+    creates conflicts. Returns dict counters."""
+    overrides = problem.get("overrides") or {}
+    daily_cap = int(overrides.get("daily_max_sessions") or 3)
+    targets = sorted(
+        (a for a in assignments if a.room == ONLINE_ROOM and not _is_split_form(a.session)),
+        key=lambda a: (-a.session.size, a.session.id),
+    )
+    from src.models import Session as _Session
+    seq = 900
+    whole = split = left = 0
+    for a in targets:
+        s = a.session
+        rebuild = _build_occupancy(assignments, N_SLOTS)
+        seat = _find_seat(problem, assignments, s, *rebuild, daily_cap, strict_section_day=True)
+        if seat is not None:
+            a.room, a.slot = seat[0], seat[1]
+            whole += 1
+            continue
+        if s.size > 80 and len(s.sections) == 2:
+            secs = sorted(s.sections)
+            code_ab = f"{s.course.code}-{s.course.programme}{s.course.level}-AB"
+            ha = _Session(s.course, seq, (s.size + 1) // 2, {secs[0]}, s.duration,
+                          False, s.field_work, code_ab)
+            hb = _Session(s.course, seq + 1, s.size // 2, {secs[1]}, s.duration,
+                          False, s.field_work, code_ab)
+            seq += 2
+            room_occ, sec_occ, lec_occ = rebuild
+            seat_a = _find_seat(problem, assignments, ha, room_occ, sec_occ, lec_occ, daily_cap, strict_section_day=True)
+            if seat_a is None:
+                left += 1
+                continue
+            _commit_seat(assignments, ha, seat_a, room_occ, sec_occ, lec_occ)
+            seat_b = _find_seat(problem, assignments, hb, room_occ, sec_occ, lec_occ, daily_cap, strict_section_day=True)
+            if seat_b is not None:
+                _commit_seat(assignments, hb, seat_b, room_occ, sec_occ, lec_occ)
+                split += 1
+            else:
+                assignments[:] = [x for x in assignments if x.session.id != ha.id]
+                left += 1
+            continue
+        left += 1
+    return {"whole": whole, "split": split, "left": left}
+
+
+def room_cell_usage(assignments, rooms):
+    """(used, total) room-slot cells for the % utilisation report. Physical
+    classes only - ONLINE and FIELD WORK occupy no classroom."""
+    used = set()
+    for a in assignments:
+        if a.room in (ONLINE_ROOM, FIELD_WORK_ROOM):
+            continue
+        d = day_index_of(a.slot)
+        if d >= 5:
+            continue
+        t0 = slot_in_day(a.slot)
+        for k in range(a.session.duration):
+            t = t0 + k
+            if t < SLOTS_PER_DAY:
+                used.add((a.room, d, t))
+    return len(used), len(rooms) * 5 * SLOTS_PER_DAY
+
+
 def postprocess(problem, assignments, sem="?"):
     """Repair, compact, fill online rooms, then pack + chain-fill (keep best of
     4 trials), rebalance, and finally force-repair section/lecturer overlaps so
@@ -461,6 +720,20 @@ def postprocess(problem, assignments, sem="?"):
     repair_assignments(problem, result)
     print(f"[{sem}] compact ...", flush=True)
     compact(problem, result, time_budget=30)
+
+    # Seat-first now, while the ONLINE split A/B rows are still consuming no
+    # room hours and the free cells still exist. If this waits until the later
+    # online-to-room sweeps, those sweeps greedily give the cells to
+    # legitimately-online rows and the split A/B courses (ES 376 / EL 162 /
+    # ...) have nowhere left to go.
+    print(f"[{sem}] early mixed-course guard (seat-first) ...", flush=True)
+    fx_early = fix_mixed_courses(problem, result, max_rounds=4)
+    print(
+        f"[{sem}] early mixed-guard: seated {fx_early['seated']} online rows in rooms | "
+        f"left: {fx_early['left']}",
+        flush=True,
+    )
+
     fill_online_rooms(problem, result, time_budget=15)
     compact(problem, result, time_budget=15)
 
@@ -649,14 +922,15 @@ def postprocess(problem, assignments, sem="?"):
                     break
             
             if not placed:
-                for pa in physical:
-                    pa.room = ONLINE_ROOM
-                online_a.room = ONLINE_ROOM
+                # Do NOT move the physical half to ONLINE - online is strictly
+                # the combined form. Leave the pair; the final fix_mixed_courses
+                # pass retries seating and reports anything that still cannot
+                # fit into a room.
                 fixed += 1
                 break
-    
-    if fixed:
-        print(f"[{sem}] fixed {fixed} mixed paired sessions (moved to ONLINE)", flush=True)
+    more = _seat_one_round(problem, result)
+    if fixed or more:
+        print(f"[{sem}] fixed {fixed} mixed paired sessions, seated {more} (never ONLINE)", flush=True)
     else:
         print(f"[{sem}] all paired sessions consistent", flush=True)
 
@@ -690,26 +964,14 @@ def postprocess(problem, assignments, sem="?"):
 
     # Paired session consistency backstop. Runs AFTER the last repair because
     # the greedy repair can move one member of an A/B split pair to ONLINE and
-    # split it. Moving both members to ONLINE keeps their slots, so their
-    # section/lecturer occupancy is unchanged and no new conflict appears.
+    # split it. Seat those ONLINE halves back into a room (never flip the
+    # physical half ONLINE - online is strictly the combined form, so an A/B
+    # half must be in person or be reported later as a residual).
     print(f"[{sem}] paired session consistency check (post-repair) ...", flush=True)
-    fixed = 0
-    split_groups = {}
-    for a in result:
-        sg = getattr(a.session, 'split_group', None)
-        if sg:
-            split_groups.setdefault(sg, []).append(a)
-
-    for sg, paired in split_groups.items():
-        physical = [a for a in paired if a.room not in (ONLINE_ROOM, FIELD_WORK_ROOM)]
-        online = [a for a in paired if a.room == ONLINE_ROOM]
-        if physical and online:
-            for a in paired:
-                a.room = ONLINE_ROOM
-            fixed += 1
+    fixed = _seat_one_round(problem, result)
 
     if fixed:
-        print(f"[{sem}] fixed {fixed} mixed paired sessions (moved to ONLINE)", flush=True)
+        print(f"[{sem}] seated {fixed} mixed paired sessions (post-repair)", flush=True)
     else:
         print(f"[{sem}] all paired sessions consistent", flush=True)
 
@@ -735,23 +997,12 @@ def postprocess(problem, assignments, sem="?"):
         flush=True,
     )
 
-    # ONLINE fallback inside the spread pass can split an A/B pair - re-unify.
+    # The spread pass can leave (or split) ONLINE rows in a unit that must be
+    # in person - seat those halves back into a room right away.
     print(f"[{sem}] paired session consistency check (post-spread) ...", flush=True)
-    fixed = 0
-    split_groups = {}
-    for a in result:
-        sg = getattr(a.session, 'split_group', None)
-        if sg:
-            split_groups.setdefault(sg, []).append(a)
-    for sg, paired in split_groups.items():
-        physical = [a for a in paired if a.room not in (ONLINE_ROOM, FIELD_WORK_ROOM)]
-        online = [a for a in paired if a.room == ONLINE_ROOM]
-        if physical and online:
-            for a in paired:
-                a.room = ONLINE_ROOM
-            fixed += 1
+    fixed = _seat_one_round(problem, result)
     if fixed:
-        print(f"[{sem}] fixed {fixed} mixed paired sessions after spread", flush=True)
+        print(f"[{sem}] seated {fixed} mixed paired sessions after spread", flush=True)
     else:
         print(f"[{sem}] paired sessions consistent after spread", flush=True)
 
@@ -820,7 +1071,8 @@ def postprocess(problem, assignments, sem="?"):
     for kseed in (7, 11, 13, 17, 19):
         snapshot = [(a, a.slot, a.room) for a in result]
         stat = fix_same_day_course(problem, result, seed=kseed)
-        key = (stat["dups_after"], stat["over_cap_after"])
+        mixed = _verify(result, problem).get("mixed_course", 0)
+        key = (stat["dups_after"], stat["over_cap_after"], mixed)
         if best is None or key < best[0]:
             best = (key, kseed, stat)
         else:
@@ -828,7 +1080,8 @@ def postprocess(problem, assignments, sem="?"):
                 a.slot, a.room = sl, rr
     print(
         f"[{sem}] best-of-K: seed={best[1]} | dups={best[0][0]} | "
-        f"over-cap-days={best[0][1]} | moves={best[2]['moves']} + "
+        f"over-cap-days={best[0][1]} | mixed-units={best[0][2]} | "
+        f"moves={best[2]['moves']} + "
         f"online={best[2]['moved_online']}, left_put={best[2]['left_put']}",
         flush=True,
     )
@@ -847,6 +1100,56 @@ def postprocess(problem, assignments, sem="?"):
     if hall_leaks:
         print(f"[{sem}] hall-leak guard relocated {hall_leaks} small classes out of halls", flush=True)
         result, remaining = ensure_conflict_free(problem, result)
+
+    # Final mixed-course guard: seat every ONLINE row that must be in person
+    # (split A/B halves and ONLINE rows of units that also have physical rows).
+    # This is what makes ES 376 / EL 162 style courses share the same row shape
+    # as every other course when a room fits, and it reports a residual instead
+    # of silently shipping split sessions as ONLINE.
+    print(f"[{sem}] final mixed-course guard (seat-first) ...", flush=True)
+    fx = fix_mixed_courses(problem, result)
+    print(
+        f"[{sem}] mixed-guard: seated {fx['seated']} online rows in rooms | "
+        f"residual split/illegal ONLINE: {fx['left']}",
+        flush=True,
+    )
+    if fx["left"]:
+        for name in fx["left_names"]:
+            a = next(x for x in result if x.session.id == name)
+            print(f"   RESIDUAL ONLINE (no room fit): {name} @ slot {a.slot}", flush=True)
+        result, remaining = ensure_conflict_free(problem, result)
+        if any(remaining[k] for k in ("section", "lecturer", "room")):
+            print(f"[{sem}] WARNING: mixed-guard left conflicts {remaining}", flush=True)
+
+    # Utilisation sweep: seat remaining combined-ONLINE rows in free room cells
+    # (splitting oversized rows into physical A/B halves when no hall fits it).
+    print(f"[{sem}] utilisation sweep (seat/split combined-ONLINE rows) ...", flush=True)
+    us = max_utilisation_sweep(problem, result)
+    print(
+        f"[{sem}] util-sweep: seated whole={us['whole']} split-AB={us['split']} | "
+        f"left online (unseatable)={us['left']}",
+        flush=True,
+    )
+    result, remaining = ensure_conflict_free(problem, result)
+    if any(remaining[k] for k in ("section", "lecturer", "room")):
+        print(f"[{sem}] WARNING: utilisation sweep left conflicts {remaining}", flush=True)
+    else:
+        print(f"[{sem}] conflict-free after utilisation sweep", flush=True)
+    sd = fix_same_day_course(problem, result, seed=7)
+    print(
+        f"[{sem}] same-day smoothing after util-sweep: "
+        f"dups={sd['dups_after']} over-cap-days={sd['over_cap_after']}",
+        flush=True,
+    )
+    result, remaining = ensure_conflict_free(problem, result)
+    if any(remaining[k] for k in ("section", "lecturer", "room")):
+        print(f"[{sem}] WARNING: same-day smoothing left conflicts {remaining}", flush=True)
+    used_cells, total_cells = room_cell_usage(result, problem["rooms"])
+    print(
+        f"[{sem}] utilisation: {used_cells}/{total_cells} room-slot cells "
+        f"({used_cells / total_cells * 100:.1f}%)",
+        flush=True,
+    )
 
     return result
 
