@@ -19,6 +19,13 @@ ONLINE_ROOM = "ONLINE"
 FIELD_WORK_ROOM = "FIELD WORK"
 NO_ROOM_ROOMS = (ONLINE_ROOM, FIELD_WORK_ROOM)
 
+# Construction-side tiering lever. When True, _allowed_rooms() drops the
+# 120-seat halls from small/mid classes (tier need <= 2) so no placement,
+# relocation, repair or fill pass can park them in a hall in the first place.
+# Turned on for the whole regen postprocess; phase1 (worker) uses the same
+# restriction via the allow_small_in_hall solve() parameter.
+TIER_STRICT = False
+
 
 def _is_no_room(room):
     return room in NO_ROOM_ROOMS
@@ -27,6 +34,7 @@ def _is_no_room(room):
 @dataclass
 class SolverWeights:
     room_oversize: int = 2
+    hall_oversize: int = 50
     evening: int = 1
     cohort_gap: int = 0
     lecturer_gap: int = 0
@@ -86,6 +94,9 @@ def _allowed_rooms(session, rooms):
     # physical (online=no) sessions always run in a real classroom.
     # If a combined online session is too large for ANY physical room,
     # ONLINE_ROOM is already in the list (from session.online=True).
+    if TIER_STRICT and _tier(max(session.size, session.course.min_capacity)) <= 2:
+        caps = {r.name: r.capacity for r in rooms}
+        names = [n for n in names if _is_no_room(n) or _tier(caps.get(n, 0)) <= 2]
     return names
 
 
@@ -114,7 +125,7 @@ def _allowed_starts(session):
     return out
 
 
-def solve(problem, time_limit=30.0, hints=None, minimize_objective=True, feasibility_jump=False, progress_cb=None, seed=None, num_workers=None, solution_path=None, log_search_progress=False, fix_hinted=False):
+def solve(problem, time_limit=30.0, hints=None, minimize_objective=True, feasibility_jump=False, progress_cb=None, seed=None, num_workers=None, solution_path=None, log_search_progress=False, fix_hinted=False, tier_objective=False, allow_small_in_hall=True):
     rooms = problem["rooms"]
     sessions = problem["sessions"]
     sections = problem["sections"]
@@ -129,6 +140,9 @@ def solve(problem, time_limit=30.0, hints=None, minimize_objective=True, feasibi
     starts = {}
     for s in sessions:
         allowed[s.id] = _allowed_rooms(s, rooms)
+        if not allow_small_in_hall and _tier(max(s.size, s.course.min_capacity)) <= 2:
+            allowed[s.id] = [r for r in allowed[s.id]
+                             if _is_no_room(r) or _tier(room_capacity.get(r, 0)) < 3]
         if not allowed[s.id]:
             raise ValueError(f"No room fits {s.id} (size {s.size}).")
         starts[s.id] = _allowed_starts(s)
@@ -213,7 +227,7 @@ def solve(problem, time_limit=30.0, hints=None, minimize_objective=True, feasibi
 
     terms = []
 
-    if minimize_objective:
+    if minimize_objective or tier_objective:
         if problem.get("soft_sections"):
             for (sec, u), b in section_overlap_vars.items():
                 terms.append(weights.section_overlap * b)
@@ -233,27 +247,31 @@ def solve(problem, time_limit=30.0, hints=None, minimize_objective=True, feasibi
                     over = _tier(room_capacity[r]) - need
                     if over > 0:
                         terms.append(weights.room_oversize * over * z[(s.id, t, r)])
-                    if s.course.practical_hours > 0 and room_kind.get(r) != "lab":
-                        terms.append(weights.lab_room * z[(s.id, t, r)])
-                    if occupies_evening:
-                        terms.append(weights.evening * z[(s.id, t, r)])
+                    if need <= 2 and _tier(room_capacity[r]) >= 3:
+                        terms.append(weights.hall_oversize * z[(s.id, t, r)])
+                    if not tier_objective:
+                        if s.course.practical_hours > 0 and room_kind.get(r) != "lab":
+                            terms.append(weights.lab_room * z[(s.id, t, r)])
+                        if occupies_evening:
+                            terms.append(weights.evening * z[(s.id, t, r)])
 
-        early = 3  # first three hours of the day (06:30-09:30)
-        for r in room_capacity:
-            if r == ONLINE_ROOM:
-                continue
-            for day in range(len(DAYS)):
-                for sl in range(early):
-                    u = day * SLOTS_PER_DAY + sl
-                    expr = sum(z[(s.id, t, r)]
-                               for s in sessions if r in allowed[s.id]
-                               for t in starts[s.id] if t <= u < t + s.duration)
-                    occ = model.NewBoolVar(f"earlyocc_{r}_{u}")
-                    model.Add(occ == expr)
-                    terms.append(weights.early_utilization * (1 - occ))
+        if not tier_objective:
+            early = 3  # first three hours of the day (06:30-09:30)
+            for r in room_capacity:
+                if r == ONLINE_ROOM:
+                    continue
+                for day in range(len(DAYS)):
+                    for sl in range(early):
+                        u = day * SLOTS_PER_DAY + sl
+                        expr = sum(z[(s.id, t, r)]
+                                   for s in sessions if r in allowed[s.id]
+                                   for t in starts[s.id] if t <= u < t + s.duration)
+                        occ = model.NewBoolVar(f"earlyocc_{r}_{u}")
+                        model.Add(occ == expr)
+                        terms.append(weights.early_utilization * (1 - occ))
 
         # Penalty for level 200+ sessions starting at 06:30 or 07:30 (slots 0, 1)
-        if weights.early_penalty_late_level:
+        if not tier_objective and weights.early_penalty_late_level:
             for s in sessions:
                 if s.course.level >= 200 and not s.online:
                     for r in allowed[s.id]:
@@ -266,7 +284,7 @@ def solve(problem, time_limit=30.0, hints=None, minimize_objective=True, feasibi
                                     if t <= u < t + s.duration:
                                         terms.append(weights.early_penalty_late_level * z[(s.id, t, r)])
 
-        if weights.room_idle:
+        if not tier_objective and weights.room_idle:
             room_slot_idle = {}
             for r in room_capacity:
                 if r in (ONLINE_ROOM, FIELD_WORK_ROOM):
@@ -334,7 +352,7 @@ def solve(problem, time_limit=30.0, hints=None, minimize_objective=True, feasibi
                         model.Add(g >= left[sl] + right[sl] + (1 - occ[sl]) - 2)
                         terms.append(weight * g)
 
-        if not problem.get("skip_gaps"):
+        if not tier_objective and not problem.get("skip_gaps"):
             add_gap_terms(sections, lambda s, sec: sec in s.sections, weights.cohort_gap, "sec")
             add_gap_terms(lecturers, lambda s, lec: s.course.lecturer == lec, weights.lecturer_gap, "lec")
 

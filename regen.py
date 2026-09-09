@@ -21,10 +21,10 @@ WORK = Path(tempfile.gettempdir()) / "umat-tt"
 os.makedirs(WORK, exist_ok=True)
 
 
-def run_phase(sem, phase, time_limit, in_path, out_path, seed, grace=180):
+def run_phase(sem, phase, time_limit, in_path, out_path, seed, mode="plain", grace=180):
     if os.path.exists(out_path):
         os.remove(out_path)
-    cmd = [PY, "-u", WORKER, sem, phase, str(time_limit), in_path or "none", out_path, str(seed)]
+    cmd = [PY, "-u", WORKER, sem, phase, str(time_limit), in_path or "none", out_path, str(seed), str(mode)]
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
     deadline = time.time() + time_limit + grace
     line = None
@@ -131,15 +131,22 @@ def run(sem):
     phase1_limit = int(problem["overrides"].get("phase1_time_limit") or 240)
 
     phase1_done = False
-    for seed in (42, 7):
-        print(f"[{sem}] phase1 seed={seed} (hints) ...", flush=True)
-        rc, _ = run_phase(sem, "1", phase1_limit, hints_path, out1, seed)
-        status, obj, assign1 = best_solution(out1, sessions)
-        if assign1:
-            phase1_done = True
-            print(f"[{sem}] phase1 recovered status={status} sessions={len(assign1)}", flush=True)
+    for mode in ("tight", "plain"):
+        label = "tight (no halls for small/mid classes)" if mode == "tight" else "plain"
+        print(f"[{sem}] phase1 mode={label} (hints) ...", flush=True)
+        for seed in (42, 7):
+            print(f"[{sem}] phase1 seed={seed} ...", flush=True)
+            rc, _ = run_phase(sem, "1", phase1_limit, hints_path, out1, seed, mode=mode)
+            status, obj, assign1 = best_solution(out1, sessions)
+            if assign1:
+                phase1_done = True
+                phase1_mode = mode
+                print(f"[{sem}] phase1 mode={mode} seed={seed} recovered status={status} sessions={len(assign1)}", flush=True)
+                break
+            print(f"[{sem}] phase1 mode={mode} seed={seed} found nothing", flush=True)
+        if phase1_done:
             break
-        print(f"[{sem}] phase1 seed={seed} found nothing", flush=True)
+        print(f"[{sem}] phase1 mode={mode} unsolvable - falling back to plain feasibility", flush=True)
     if not phase1_done:
         print(f"[{sem}] ABORT: no phase1 solution found", flush=True)
         print(
@@ -445,6 +452,11 @@ def postprocess(problem, assignments, sem="?"):
     clones of the input."""
     problem["soft_sections"] = False
     problem["soft_lecturer"] = False
+    # Construction-side tiering: for the whole postprocess, small/mid classes
+    # (tier need <= 2) are not allowed to take the 120-seat halls, so no pass
+    # can re-plant them there (phase1 was solved tight already as well).
+    import src.solver as _solver
+    _solver.TIER_STRICT = True
     result = clone_assign(assignments)
     repair_assignments(problem, result)
     print(f"[{sem}] compact ...", flush=True)
@@ -827,6 +839,14 @@ def postprocess(problem, assignments, sem="?"):
         print(f"[{sem}] WARNING: spread left conflicts {remaining}", flush=True)
     else:
         print(f"[{sem}] final state conflict-free after spread (section/lecturer/room = 0)", flush=True)
+
+    # Construction-side tiering guard: whatever pass re-planted small/mid
+    # classes into the 120-seat halls, evict them into their best fitting room.
+    from src.pack import evacuate_smalls_from_halls
+    hall_leaks = evacuate_smalls_from_halls(problem, result)
+    if hall_leaks:
+        print(f"[{sem}] hall-leak guard relocated {hall_leaks} small classes out of halls", flush=True)
+        result, remaining = ensure_conflict_free(problem, result)
 
     return result
 

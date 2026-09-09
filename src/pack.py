@@ -1,7 +1,7 @@
 import time
 
 from .slots import N_SLOTS, SLOTS_PER_DAY, day_index_of
-from .solver import _allowed_rooms, _allowed_starts, _is_no_room, ONLINE_ROOM, FIELD_WORK_ROOM, _verify
+from .solver import _allowed_rooms, _allowed_starts, _is_no_room, _tier, ONLINE_ROOM, FIELD_WORK_ROOM, _verify
 
 ROOM_W = 2.0
 COHORT_W = 1.0
@@ -53,6 +53,20 @@ class Packer:
         self.tie_eps = 0.001 if allow_plateau else 0.0
         self.rng = rng if rng is not None else random.Random()
         self.allowed = {s.id: _allowed_rooms(s, problem["rooms"]) for s in self.sessions}
+        room_cap = {r.name: r.capacity for r in problem["rooms"]}
+        sessions_by_id = {s.id: s for s in self.sessions}
+        for sid, rooms in self.allowed.items():
+            need = _tier(max(sessions_by_id[sid].size, sessions_by_id[sid].course.min_capacity))
+
+            def pref_key(r, need=need):
+                c = room_cap.get(r)
+                if c is None:
+                    return (1, 0)
+                if need > 2:
+                    return (0, -c)
+                return (0, c)
+
+            rooms.sort(key=pref_key)
         self.starts = {s.id: _allowed_starts(s) for s in self.sessions}
         self.assign = {a.session.id: a for a in assignments}
         self.sec_occ = {}
@@ -638,3 +652,33 @@ class Packer:
 def pack(problem, assignments, time_budget=180.0, max_rounds=400, debug=False, allow_plateau=False, rng=None):
     p = Packer(problem, assignments, debug=debug, allow_plateau=allow_plateau, rng=rng)
     return p.run(time_budget, max_rounds)
+
+
+def evacuate_smalls_from_halls(problem, assignments):
+    """Construction-side tiering guard: move any small/mid class (need tier <= 2,
+    i.e. at most 80 seats) that is still sitting in a 120-seat hall into its best
+    conflict-free fitting room. Runs last so it catches whichever tail pass
+    re-planted them (repairs/spreads that use absolute room names). Uses the
+    Packer's own conflict-safe relocate machinery. Returns sessions moved."""
+    from .solver import _tier
+
+    pk = Packer(problem, assignments)
+    cap = {r.name: r.capacity for r in problem["rooms"]}
+    moved = 0
+    for _ in range(3):
+        changed = False
+        for s in pk.sessions:
+            if s.field_work or _tier(max(s.size, s.course.min_capacity)) > 2:
+                continue
+            a = pk.assign.get(s.id)
+            if a is None or _is_no_room(a.room) or _tier(cap.get(a.room, 0)) < 3:
+                continue
+            for t, r in pk._candidate_homes(s, exclude_t=a.slot, exclude_r=a.room):
+                pk._remove(s)
+                pk._place(s, t, r)
+                moved += 1
+                changed = True
+                break
+        if not changed:
+            break
+    return moved

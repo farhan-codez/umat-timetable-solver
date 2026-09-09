@@ -577,7 +577,7 @@ def load_settings(data_dir):
     if path.exists():
         with open(path, encoding="utf-8") as fh:
             raw = json.load(fh)
-        for key in ("room_oversize", "evening", "cohort_gap", "lecturer_gap", "early_utilization", "early_penalty_late_level", "lecturer_overlap", "section_overlap", "lab_room", "online", "room_idle"):
+        for key in ("room_oversize", "hall_oversize", "evening", "cohort_gap", "lecturer_gap", "early_utilization", "early_penalty_late_level", "lecturer_overlap", "section_overlap", "lab_room", "online", "room_idle"):
             if key in raw.get("weights", {}):
                 setattr(weights, key, int(raw["weights"][key]))
     return weights
