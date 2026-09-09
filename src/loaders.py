@@ -593,6 +593,8 @@ SETTINGS_OVERRIDES = {
     "max_class_cap": 0,           # largest allowed combined/co-taught class (0 = biggest room capacity)
     "phase1_time_limit": 240,     # seconds for the phase-1 feasibility solve
     "regen_pack_budget": 0,       # seconds for the packing step (0 = pipeline defaults)
+    "daily_max_sessions": 3,      # soft cap on scheduled sessions per section per day (0 = no cap)
+    "daily_cap_online_fallback": False,  # allow ONLINE fallback to meet the daily cap (costs in-person)
 }
 
 

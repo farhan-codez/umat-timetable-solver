@@ -4,7 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from src.paths import PROJECT_ROOT, DATA_DIR, OUTPUT_DIR
 from src.loaders import load_problem, list_semesters
-from src.solver import load_solution_json, repair_assignments, _verify, Assignment, ONLINE_ROOM, FIELD_WORK_ROOM, _allowed_starts
+from src.solver import load_solution_json, repair_assignments, _verify, Assignment, ONLINE_ROOM, FIELD_WORK_ROOM, _allowed_starts, fix_same_day_course
 from src.slots import DAYS, SLOTS_PER_DAY, N_SLOTS, day_index_of, slot_in_day
 from src.compact import compact, fill_online_rooms
 from src.pack import pack, Packer
@@ -708,6 +708,125 @@ def postprocess(problem, assignments, sem="?"):
         print(f"[{sem}] WARNING: could not fully repair {remaining}", flush=True)
     else:
         print(f"[{sem}] final state conflict-free (section/lecturer/room = 0)", flush=True)
+
+    # Student-load pass: spread same-course/day duplicates and cap sessions per
+    # section per day (settings.json daily_max_sessions, default 3; field work
+    # excluded). Sessions that cannot be moved keep their spot and are reported;
+    # only online-eligible sessions fall back to ONLINE as a last resort.
+    print(f"[{sem}] spread same-course/daily-cap (student load) ...", flush=True)
+    spread = fix_same_day_course(problem, result)
+    print(
+        f"[{sem}] spread: dups {spread['dups_before']}->{spread['dups_after']} "
+        f"| over-cap days {spread['over_cap_before']}->{spread['over_cap_after']} "
+        f"| moved {spread['moves']} physical + {spread['moved_online']} online, "
+        f"{spread['left_put']} kept in place (cap={spread['cap']})",
+        flush=True,
+    )
+
+    # ONLINE fallback inside the spread pass can split an A/B pair - re-unify.
+    print(f"[{sem}] paired session consistency check (post-spread) ...", flush=True)
+    fixed = 0
+    split_groups = {}
+    for a in result:
+        sg = getattr(a.session, 'split_group', None)
+        if sg:
+            split_groups.setdefault(sg, []).append(a)
+    for sg, paired in split_groups.items():
+        physical = [a for a in paired if a.room not in (ONLINE_ROOM, FIELD_WORK_ROOM)]
+        online = [a for a in paired if a.room == ONLINE_ROOM]
+        if physical and online:
+            for a in paired:
+                a.room = ONLINE_ROOM
+            fixed += 1
+    if fixed:
+        print(f"[{sem}] fixed {fixed} mixed paired sessions after spread", flush=True)
+    else:
+        print(f"[{sem}] paired sessions consistent after spread", flush=True)
+
+    # Post-spread online-to-room sweep: the spread pass relocated physical
+    # classes and opened free cells (including the large halls) AFTER the
+    # earlier conversion sweeps ran. Convert the remaining ONLINE units into
+    # those freed cells, still honouring the same-course/day rule, the daily
+    # load cap and A/B pair unity so the student-load work is not undone.
+    print(f"[{sem}] post-spread online-to-room sweep ...", flush=True)
+    from src.online_placement import place_courses_sequential
+    overrides = problem.get("overrides") or {}
+    sweep_cap = int(overrides.get("daily_max_sessions") or 3)
+    swept, result = place_courses_sequential(problem, result, daily_cap=sweep_cap)
+    if swept:
+        print(f"[{sem}] post-spread sweep converted {swept} online sessions in person", flush=True)
+    else:
+        print(f"[{sem}] post-spread sweep found no online sessions to convert", flush=True)
+
+    # Size-tier room-fit pass (option B): keep the largest rooms for the
+    # largest cohorts - evict smaller classes from the 120-seat halls and seat
+    # the biggest ONLINE units into the freed hall cells (chain-swap, both stay
+    # in person). Respects the same-course/day rule, the daily cap and pair
+    # uniformity.
+    print(f"[{sem}] size-tier room-fit pass ...", flush=True)
+    from src.online_placement import place_by_size_tiers
+    sized = place_by_size_tiers(problem, result)
+    print(
+        f"[{sem}] size-fit: evicted {sized['evicted']} smaller classes from halls | "
+        f"seated {sized['seated_online']} big online in halls | "
+        f"{sized['left_big_online']} big online left (reported) | "
+        f"small/mid still in halls: {sized['small_mid_in_hall_after']}",
+        flush=True,
+    )
+
+    # Chain-relocation hall evacuation: classes stuck in halls whose only
+    # fitting smaller cells are blocked by another class that CAN move. BFS
+    # chains (S -> X's cell -> X -> X's free cell) clear those, freeing hall
+    # seats for the big cohorts. Same rules as the spread pass are enforced
+    # per hop; field work / ONLINE stay untouched.
+    print(f"[{sem}] chain-relocation hall evacuation ...", flush=True)
+    from src.online_placement import relocate_stuck_hall_residents
+    chained = relocate_stuck_hall_residents(problem, result)
+    print(
+        f"[{sem}] chain-reloc: moved {chained['moved']} classes out of halls | "
+        f"{chained['left_leftover_hall']} small/mid still stuck (reported)",
+        flush=True,
+    )
+
+    # Re-seat the big ONLINE leftovers into the hall cells that the chain pass
+    # just freed; give it a fresh attempt budget.
+    print(f"[{sem}] re-seat big online after evacuation ...", flush=True)
+    sized2 = place_by_size_tiers(problem, result)
+    print(
+        f"[{sem}] re-seat: +{sized2['seated_online']} big online in halls | "
+        f"{sized2['left_big_online']} big online left | "
+        f"small/mid in halls: {sized2['small_mid_in_hall_after']}",
+        flush=True,
+    )
+
+    # Best-of-K spread: the dup residual is order-dependent (shared swap
+    # budget, shuffled traversal). Run the same layout through several shuffle
+    # orders and keep the one with the fewest duplicates - deterministic, no
+    # full re-solve.
+    print(f"[{sem}] best-of-K spread (same layout, 5 shuffle orders) ...", flush=True)
+    best = None
+    for kseed in (7, 11, 13, 17, 19):
+        snapshot = [(a, a.slot, a.room) for a in result]
+        stat = fix_same_day_course(problem, result, seed=kseed)
+        key = (stat["dups_after"], stat["over_cap_after"])
+        if best is None or key < best[0]:
+            best = (key, kseed, stat)
+        else:
+            for a, sl, rr in snapshot:
+                a.slot, a.room = sl, rr
+    print(
+        f"[{sem}] best-of-K: seed={best[1]} | dups={best[0][0]} | "
+        f"over-cap-days={best[0][1]} | moves={best[2]['moves']} + "
+        f"online={best[2]['moved_online']}, left_put={best[2]['left_put']}",
+        flush=True,
+    )
+
+    # Final guard after the spread + pair pass
+    result, remaining = ensure_conflict_free(problem, result)
+    if any(remaining[k] for k in ("section", "lecturer", "room")):
+        print(f"[{sem}] WARNING: spread left conflicts {remaining}", flush=True)
+    else:
+        print(f"[{sem}] final state conflict-free after spread (section/lecturer/room = 0)", flush=True)
 
     return result
 

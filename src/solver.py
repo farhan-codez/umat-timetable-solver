@@ -1,4 +1,5 @@
 import json
+import random
 from dataclasses import dataclass
 
 from ortools.sat.python import cp_model
@@ -482,6 +483,10 @@ def _verify(assignments, problem):
         by_course_day = {}
         for a in assignments:
             if sec in a.session.sections:
+                # Field work is an off-campus trip block, not a regular class:
+                # it should not create (or count toward) same-day flags.
+                if a.session.field_work or a.room == FIELD_WORK_ROOM:
+                    continue
                 d = day_index_of(a.slot)
                 key = (a.session.course.code, d)
                 by_course_day.setdefault(key, []).append(a.session.id)
@@ -651,3 +656,265 @@ def repair_assignments(problem, assignments):
             fixed_count += 1
         add(a)
     return assignments, fixed_count
+
+
+def fix_same_day_course(problem, assignments, max_rounds=6, seed=7):
+    """Spread classes so that no section has (a) the same course twice on one
+    day or (b) more than `daily_max_sessions` scheduled sessions on one day
+    (settings.json, default 3; field work is excluded from the cap).
+
+    Relocations only move sessions into FREE cells on other days, so in-person
+    placement is preserved wherever possible; a session that cannot be moved
+    keeps its current spot and is reported (left_put). ONLINE-eligible sessions
+    may fall back to the ONLINE venue on a free day as a last resort - the only
+    path that removes a session from a real room.
+
+    Mutates the Assignment objects in place and returns a dict of counters:
+    moves, moved_online, left_put, dups_before, dups_after, over_cap_before,
+    over_cap_after, cap.
+    """
+    overrides = problem.get("overrides") or {}
+    cap = int(overrides.get("daily_max_sessions") or 0)
+    if cap <= 0:
+        cap = 3
+    cap_online = bool(overrides.get("daily_cap_online_fallback") in (True, 1, "1", "true", "True", "yes"))
+    rooms = problem["rooms"]
+    sections = problem["sections"]
+    rng = random.Random(seed)
+
+    room_occ = {}
+    sec_occ = {}
+    lec_occ = {}
+
+    def slots_of(a):
+        return range(a.slot, a.slot + a.session.duration)
+
+    def add(a):
+        s = a.session
+        if not _is_no_room(a.room):
+            for u in slots_of(a):
+                room_occ.setdefault((a.room, u), set()).add(s.id)
+        for u in slots_of(a):
+            for sec in s.sections:
+                sec_occ.setdefault((sec, u), set()).add(s.id)
+            if s.course.lecturer:
+                lec_occ.setdefault((s.course.lecturer, u), set()).add(s.id)
+
+    def remove(a):
+        s = a.session
+        if not _is_no_room(a.room):
+            for u in slots_of(a):
+                if (a.room, u) in room_occ:
+                    room_occ[(a.room, u)].discard(s.id)
+        for u in slots_of(a):
+            for sec in s.sections:
+                if (sec, u) in sec_occ:
+                    sec_occ[(sec, u)].discard(s.id)
+            if s.course.lecturer and (s.course.lecturer, u) in lec_occ:
+                lec_occ[(s.course.lecturer, u)].discard(s.id)
+
+    def is_field(a):
+        return a.session.field_work or a.room == FIELD_WORK_ROOM
+
+    for a in assignments:
+        add(a)
+
+    def count_violations():
+        dups = 0
+        over = 0
+        for sec in sections:
+            for d in range(len(DAYS)):
+                day_sessions = [a for a in assignments
+                                if not is_field(a) and day_index_of(a.slot) == d
+                                and sec in a.session.sections]
+                if not day_sessions:
+                    continue
+                seen = {}
+                for a in day_sessions:
+                    seen[a.session.course.code] = seen.get(a.session.course.code, 0) + 1
+                dups += sum(1 for n in seen.values() if n > 1)
+                if len(day_sessions) > cap:
+                    over += 1
+        return dups, over
+
+    def candidates():
+        cand = {}
+        for sec in sections:
+            for d in range(len(DAYS)):
+                day_sessions = [a for a in assignments
+                                if not is_field(a) and day_index_of(a.slot) == d
+                                and sec in a.session.sections]
+                if not day_sessions:
+                    continue
+                day_sessions.sort(key=lambda a: (a.slot, a.session.id))
+                used = set()
+                kept = 0
+                for a in day_sessions:
+                    code = a.session.course.code
+                    if kept < cap and code not in used:
+                        used.add(code)
+                        kept += 1
+                    else:
+                        reasons = cand.setdefault(a.session.id, set())
+                        if code in used:
+                            reasons.add("dup")   # same course twice that day (hard fix)
+                        if kept >= cap:
+                            reasons.add("cap")   # over the daily limit (soft fix)
+        return cand
+
+    def target_ok(a, d):
+        """Day d may host session a only if, for every section of a, the day has
+        no other session of the same course and stays under the cap."""
+        code = a.session.course.code
+        for sec in a.session.sections:
+            n = 0
+            for b in assignments:
+                if b.session.id == a.session.id or is_field(b):
+                    continue
+                if day_index_of(b.slot) != d or sec not in b.session.sections:
+                    continue
+                if b.session.course.code == code:
+                    return False
+                n += 1
+            if n >= cap:
+                return False
+        return True
+
+    def sec_lec_free(a, t):
+        for u in range(t, t + a.session.duration):
+            for sec in a.session.sections:
+                if sec_occ.get((sec, u)):
+                    return False
+            lec = a.session.course.lecturer
+            if lec and lec_occ.get((lec, u)):
+                return False
+        return True
+
+    def room_free(r, t, dur):
+        return all(not room_occ.get((r, u)) for u in range(t, t + dur))
+
+    swap_budget = 2000
+
+    def try_swap(a, t, r, old_cell):
+        """In-person swap: place `a` at (t, r) in a real room even though the
+        block is occupied, by relocating the (single) occupant elsewhere - to
+        `a`'s old cell or to any free cell on another day. Preserves in-person
+        placement, so utilization is untouched. Returns True if applied."""
+        block = set()
+        for u in range(t, t + a.session.duration):
+            block.update(room_occ.get((r, u), ()))
+        if len(block) != 1:
+            return False
+        sid = next(iter(block))
+        b = next((x for x in assignments if x.session.id == sid), None)
+        if b is None or is_field(b):
+            return False
+        bs = b.session
+        if not (b.slot <= t and b.slot + bs.duration >= t + a.session.duration):
+            return False
+        remove(b)
+        placed = None
+        ot, orm = old_cell
+        if (orm in _allowed_rooms(bs, rooms) and not _is_no_room(orm)
+                and room_free(orm, ot, bs.duration)
+                and sec_lec_free(b, ot) and target_ok(b, day_index_of(ot))):
+            placed = (ot, orm)
+        if placed is None and not is_field(b):
+            for tt in _allowed_starts(bs):
+                dd = day_index_of(tt)
+                if dd == day_index_of(b.slot) or not target_ok(b, dd) or not sec_lec_free(b, tt):
+                    continue
+                brooms = [br for br in _allowed_rooms(bs, rooms) if not _is_no_room(br)]
+                if b.room in brooms:
+                    brooms = [b.room] + [br for br in brooms if br != b.room]
+                for br in brooms:
+                    if room_free(br, tt, bs.duration):
+                        placed = (tt, br)
+                        break
+                if placed:
+                    break
+        if placed is None:
+            add(b)
+            return False
+        b.slot, b.room = placed
+        add(b)
+        a.slot, a.room = t, r
+        add(a)
+        return True
+
+    dups_before, over_before = count_violations()
+    moved = 0
+    moved_online = 0
+    moved_ids = set()
+
+    for _ in range(max_rounds):
+        open_cand = candidates()
+        if not open_cand:
+            break
+        lst = [a for a in assignments if a.session.id in open_cand]
+        rng.shuffle(lst)
+        progress = False
+        for a in lst:
+            if is_field(a) or a.session.id in moved_ids:
+                continue
+            reasons = open_cand[a.session.id]
+            cur_day = day_index_of(a.slot)
+            old_cell = (a.slot, a.room)
+            planned = None
+            swapped = False
+            remove(a)
+            cand_rooms = _allowed_rooms(a.session, rooms)
+            real_rooms = [r for r in cand_rooms if not _is_no_room(r)]
+            if a.room in real_rooms:
+                real_rooms = [a.room] + [r for r in real_rooms if r != a.room]
+            for t in _allowed_starts(a.session):
+                d = day_index_of(t)
+                if d == cur_day or not target_ok(a, d) or not sec_lec_free(a, t):
+                    continue
+                for r in real_rooms:
+                    if room_free(r, t, a.session.duration):
+                        planned = (t, r)
+                        break
+                    if swap_budget > 0:
+                        swap_budget -= 1
+                        if try_swap(a, t, r, old_cell):
+                            planned = (t, r)
+                            swapped = True
+                            break
+                if planned:
+                    break
+            # ONLINE fallback only resolves hard duplicate-course days, and the
+            # daily cap too only when explicitly enabled - it costs in-person.
+            allow_online = "dup" in reasons or (cap_online and "cap" in reasons)
+            if planned is None and a.session.online and allow_online:
+                for t in _allowed_starts(a.session):
+                    d = day_index_of(t)
+                    if d == cur_day or not target_ok(a, d) or not sec_lec_free(a, t):
+                        continue
+                    planned = (t, ONLINE_ROOM)
+                    break
+            if planned is not None:
+                if not swapped:
+                    a.slot, a.room = planned
+                moved_ids.add(a.session.id)
+                if _is_no_room(a.room):
+                    moved_online += 1
+                else:
+                    moved += 1
+                progress = True
+            add(a)
+        if not progress:
+            break
+
+    dups_after, over_after = count_violations()
+    left_put = len(candidates())
+    return {
+        "moves": moved,
+        "moved_online": moved_online,
+        "left_put": left_put,
+        "dups_before": dups_before,
+        "dups_after": dups_after,
+        "over_cap_before": over_before,
+        "over_cap_after": over_after,
+        "cap": cap,
+    }

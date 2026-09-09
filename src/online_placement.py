@@ -279,7 +279,7 @@ def place_online_courses(problem, assignments, time_limit=30.0, seed=42):
     return PlacementResult(len(session_vars) - sum(1 for v in session_vars.values() if solver.Value(v) == 0), placed_sessions, new_assignments)
 
 
-def place_courses_sequential(problem, assignments):
+def place_courses_sequential(problem, assignments, daily_cap=None):
     """
     Sequential greedy placement after the consistency passes.
 
@@ -289,6 +289,10 @@ def place_courses_sequential(problem, assignments):
     mixed. Courses may end up partially in person / partially ONLINE - that is
     allowed; only split A/B pairs stay uniform.
 
+    When daily_cap is given, a session is only placed on a day that keeps every
+    one of its sections at or below the cap (field work is excluded from the
+    count) - the same rule the student-load spread pass enforces.
+
     Most-constrained-first ordering; repeated rounds until no unit fits.
     Returns (placed_sessions, new_assignments).
     """
@@ -296,6 +300,19 @@ def place_courses_sequential(problem, assignments):
 
     room_occ, sec_occ, lec_occ = _build_full_occupancy(assignments)
     rooms = problem["rooms"]
+    room_cap = {r.name: r.capacity for r in rooms}
+
+    def day_count_excluding(to_remove_ids):
+        counts = defaultdict(int)
+        for a in assignments:
+            if a.session.field_work or a.room == FIELD_WORK_ROOM:
+                continue
+            if a.session.id in to_remove_ids:
+                continue
+            d = day_index_of(a.slot)
+            for sec in a.session.sections:
+                counts[(sec, d)] += 1
+        return counts
 
     # Group currently-ONLINE assignments into fill units.
     online_units = defaultdict(list)  # key: split_group else session id
@@ -351,6 +368,7 @@ def place_courses_sequential(problem, assignments):
             # Days on which each (section, course) is already busy, excluding
             # this unit's own ONLINE sessions (they are removed on commit).
             daily = defaultdict(set)
+            day_count = day_count_excluding(to_remove_ids)
             for a in assignments:
                 if a.session.id in to_remove_ids:
                     continue
@@ -359,6 +377,7 @@ def place_courses_sequential(problem, assignments):
                     daily[(sec, a.session.course.code)].add(d)
 
             sessions = [a.session for a in unit]
+            sid_secs = {s.id: frozenset(s.sections) for s in sessions}
             session_cells = {}
             ok = True
             for s in sessions:
@@ -366,6 +385,11 @@ def place_courses_sequential(problem, assignments):
                 for t in _allowed_starts(s):
                     day = day_index_of(t)
                     if any(day in daily[(sec, s.course.code)] for sec in s.sections):
+                        continue
+                    if daily_cap is not None and any(
+                        day_count[(sec, day)] + 1 > daily_cap
+                        for sec in s.sections
+                    ):
                         continue
                     for r in _allowed_rooms(s, rooms):
                         if _is_no_room(r):
@@ -375,6 +399,12 @@ def place_courses_sequential(problem, assignments):
                 if not cells:
                     ok = False
                     break
+                # Tightest-fit first: a session that fits an 80-cap room takes
+                # it before a 120-seat hall, so the largest rooms stay free for
+                # the largest cohorts. No placement is lost - the backtracking
+                # below still falls back to any bigger room if nothing smaller
+                # is free.
+                cells.sort(key=lambda c: (room_cap[c[1]], c[0]))
                 session_cells[s.id] = cells
             if not ok:
                 continue
@@ -425,6 +455,18 @@ def place_courses_sequential(problem, assignments):
                                 break
                     if conflict:
                         continue
+                    if daily_cap is not None:
+                        day = day_index_of(t)
+                        for sec in s.sections:
+                            c = day_count[(sec, day)]
+                            for cs_id, (cs_t, _cs_r) in chosen.items():
+                                if day_index_of(cs_t) == day and sec in sid_secs[cs_id]:
+                                    c += 1
+                            if c + 1 > daily_cap:
+                                conflict = True
+                                break
+                        if conflict:
+                            continue
                     chosen[s.id] = (t, r)
                     if backtrack(idx + 1):
                         return True
@@ -465,3 +507,415 @@ def place_courses_sequential(problem, assignments):
             break
 
     return placed_sessions, assignments
+
+
+def place_by_size_tiers(problem, assignments, big_tier=96, max_rounds=4, max_attempts=5000):
+    """Room-fit reallocation so the largest rooms host the largest cohorts.
+
+    Two phases, both preserving section/lecturer/room exclusivity, the
+    same-course-per-day rule, the daily session cap (settings
+    daily_max_sessions) and A/B pair uniformity:
+
+    Phase 1 - tidy: physical classes sized <= big_tier sitting in a 120-seat
+    hall are relocated into the smallest fitting room with a compliant free
+    cell (SR 4 for <=40, an 80-cap room for mid-sized).
+
+    Phase 2 - seat the biggest ONLINE units into hall cells: a big online unit
+    (A/B pair or single) takes a compliant hall cell; if that cell is held by a
+    smaller physical class, the class is chain-swapped out to a fitting room
+    first, so utilisation is not lost. Units are seated all-or-nothing and any
+    failed attempt is rolled back.
+
+    Returns counters dict. Mutates Assignment objects in place.
+    """
+    from .slots import N_SLOTS, day_index_of
+
+    rooms = problem["rooms"]
+    overrides = problem.get("overrides") or {}
+    cap = int(overrides.get("daily_max_sessions") or 3)
+    if cap <= 0:
+        cap = 3
+    rcap = {r.name: r.capacity for r in rooms}
+    hall_rooms = sorted(r.name for r in rooms if r.capacity >= 120)
+    non_hall = sorted(r.name for r in rooms if r.capacity < 120)
+
+    def refresh():
+        return _build_full_occupancy(assignments)
+
+    room_occ, sec_occ, lec_occ = refresh()
+
+    def cell_free(s, t, r):
+        return _is_cell_free(s, t, r, room_occ, sec_occ, lec_occ)
+
+    def is_field(a):
+        return a.session.field_work or a.room == FIELD_WORK_ROOM
+
+    def day_ok(s, d, exclude):
+        for sec in s.sections:
+            n = 0
+            for b in assignments:
+                if b.session.id in exclude or is_field(b):
+                    continue
+                if day_index_of(b.slot) != d or sec not in b.session.sections:
+                    continue
+                if b.session.course.code == s.course.code:
+                    return False
+                n += 1
+            if n >= cap:
+                return False
+        return True
+
+    def candidate_cells(s, rooms_sel):
+        allowed = _allowed_rooms(s, rooms)
+        out = []
+        for t in _allowed_starts(s):
+            d = day_index_of(t)
+            if not day_ok(s, d, {s.id}):
+                continue
+            for r in rooms_sel:
+                if r not in allowed or _is_no_room(r):
+                    continue
+                if cell_free(s, t, r):
+                    out.append((t, r))
+        return out
+
+    def sole_occupant(r, t, dur):
+        ids = set()
+        arr = room_occ.get(r)
+        if not arr:
+            return None
+        for u in range(t, t + dur):
+            v = arr[u]
+            if v is not None:
+                ids.add(v)
+        if len(ids) != 1:
+            return None
+        b = next((a for a in assignments if a.session.id == next(iter(ids))), None)
+        if b is None or b.room != r:
+            return None
+        bs = b.session
+        if not (b.slot <= t and b.slot + bs.duration >= t + dur):
+            return None
+        return b
+
+    def relocate(b, evicted_here):
+        prev = (b.slot, b.room)
+        cands = candidate_cells(b.session, non_hall)
+        if not cands:
+            return False
+        cands.sort(key=lambda it: (rcap[it[1]], it[0]))
+        b.slot, b.room = cands[0]
+        evicted_here.append((b, prev))
+        return True
+
+    attempts = 0
+    evicted = []
+
+    # Phase 1: tidy smaller physical classes out of the halls.
+    def phase1(evicted):
+        nonlocal attempts, room_occ, sec_occ, lec_occ
+        changed = False
+        for a in list(assignments):
+            if attempts >= max_attempts:
+                break
+            if is_field(a) or a.session.field_work or a.room not in hall_rooms:
+                continue
+            if a.session.size > big_tier:
+                continue
+            cands = candidate_cells(a.session, non_hall)
+            if not cands:
+                continue
+            cands.sort(key=lambda it: (rcap[it[1]], it[0]))
+            prev = (a.slot, a.room)
+            a.slot, a.room = cands[0]
+            evicted.append((a, prev))
+            changed = True
+            attempts += 1
+            room_occ, sec_occ, lec_occ = refresh()
+        return changed
+
+    # Phase 2: seat the biggest ONLINE units into the halls.
+    online_units = {}
+    for a in assignments:
+        if a.room != ONLINE_ROOM or a.session.field_work:
+            continue
+        if a.session.size < big_tier:
+            continue
+        key = a.session.split_group or ("sid", a.session.id)
+        online_units.setdefault(key, []).append(a)
+
+    seated = []
+    tried = set()
+
+    def try_seat(a, evicted_here):
+        nonlocal attempts, room_occ, sec_occ, lec_occ
+        allowed = _allowed_rooms(a.session, rooms)
+        for t in _allowed_starts(a.session):
+            d = day_index_of(t)
+            if not day_ok(a.session, d, {a.session.id}):
+                continue
+            for r in hall_rooms:
+                if r not in allowed or _is_no_room(r):
+                    continue
+                attempts += 1
+                if attempts > max_attempts:
+                    return False
+                if cell_free(a.session, t, r):
+                    a.slot, a.room = t, r
+                    room_occ, sec_occ, lec_occ = refresh()
+                    return True
+                b = sole_occupant(r, t, a.session.duration)
+                if b is None or is_field(b) or b.session.size > big_tier or b.session.online:
+                    continue
+                if relocate(b, evicted_here):
+                    a.slot, a.room = t, r
+                    room_occ, sec_occ, lec_occ = refresh()
+                    return True
+        return False
+
+    def phase2(pos_seated, pos_tried):
+        nonlocal attempts, room_occ, sec_occ, lec_occ
+        changed = False
+        for unit in sorted(online_units.values(), key=len, reverse=True):
+            key = unit[0].session.split_group or ("sid", unit[0].session.id)
+            if key in pos_tried:
+                continue
+            pos_tried.add(key)
+            unit_prev = [(a, a.slot, a.room) for a in unit]
+            evicted_here = []
+            ok = all(try_seat(a, evicted_here) for a in unit)
+            if ok:
+                pos_seated.extend(a.session.id for a in unit)
+                changed = True
+            else:
+                for a, sl, rr in unit_prev:
+                    a.slot, a.room = sl, rr
+                for b, (sl, rr) in evicted_here:
+                    b.slot, b.room = sl, rr
+                room_occ, sec_occ, lec_occ = refresh()
+        return changed
+
+    for _ in range(max_rounds):
+        changed1 = phase1(evicted)
+        changed2 = phase2(seated, tried)
+        if not (changed1 or changed2) or attempts >= max_attempts:
+            break
+
+    leftover = sum(
+        1 for a in assignments
+        if a.room == ONLINE_ROOM and not a.session.field_work and a.session.size >= big_tier
+    )
+    still_in_hall = sum(
+        1 for a in assignments
+        if not is_field(a) and a.room in hall_rooms and a.session.size <= big_tier
+    )
+    return {
+        "evicted": len(evicted),
+        "seated_online": len(seated),
+        "left_big_online": leftover,
+        "small_mid_in_hall_after": still_in_hall,
+        "attempts": attempts,
+    }
+
+
+def relocate_stuck_hall_residents(problem, assignments, big_tier=96, max_depth=3,
+                                  max_rounds=6, max_attempts=1500000):
+    """Chain-relocate physical classes stuck in 120-seat halls.
+
+    The size-tier pass only moves a class that can go DIRECTLY to a free
+    smaller cell. A class can be stuck though - every fitting smaller cell is
+    blocked by one other class which itself has a free cell somewhere. This
+    pass finds those chains:
+
+        S (in hall) -> cell of X -> X -> X's free cell -> ...
+
+    Depth-limited BFS over the relocation graph. Rules are identical to the
+    rest of the pipeline: same-course-per-day and the daily cap (settings
+    daily_max_sessions) are enforced for every hop, field work is untouched,
+    ONLINE is untouched, and no class ever leaves a real room (utilization is
+    preserved). Chains are committed as a unit - if the tail cannot be placed
+    the search backtracks and nothing moves.
+
+    Returns counters dict. Mutates Assignment objects in place.
+    """
+    from .slots import N_SLOTS, SLOTS_PER_DAY, day_index_of
+
+    rooms = problem["rooms"]
+    overrides = problem.get("overrides") or {}
+    cap = int(overrides.get("daily_max_sessions") or 3)
+    if cap <= 0:
+        cap = 3
+    rcap = {r.name: r.capacity for r in rooms}
+    hall_rooms = sorted(r.name for r in rooms if r.capacity >= 120)
+    non_hall = sorted(r.name for r in rooms if r.capacity < 120)
+    by_id = {a.session.id: a for a in assignments}
+
+    def refresh():
+        return _build_full_occupancy(assignments)
+
+    room_occ, sec_occ, lec_occ = refresh()
+    secday = {}
+
+    def rebuild_secday():
+        secday.clear()
+        for a in assignments:
+            if a.session.field_work or a.room == FIELD_WORK_ROOM:
+                continue
+            d = day_index_of(a.slot)
+            for sec in a.session.sections:
+                secday.setdefault((sec, d), set()).add(a.session.id)
+
+    rebuild_secday()
+
+    def is_field(a):
+        return a.session.field_work or a.room == FIELD_WORK_ROOM
+
+    def day_ok(sid, d, displaced):
+        """Day d may host session sid given the ids that leave their days in
+        this chain (displaced). Same-course-per-day plus the daily cap."""
+        s = by_id[sid].session
+        dep = displaced | {sid}
+        for sec in s.sections:
+            ids = secday.get((sec, d), set()) - dep
+            if len(ids) >= cap:
+                return False
+            for i in ids:
+                if by_id[i].session.course.code == s.course.code:
+                    return False
+        return True
+
+    def stucks():
+        out = []
+        for a in assignments:
+            if is_field(a) or a.room not in hall_rooms:
+                continue
+            if a.session.size > big_tier:
+                continue
+            allow = _allowed_rooms(a.session, rooms) or []
+            target_rooms = [r for r in non_hall if r in allow and not _is_no_room(r)]
+            direct = False
+            for t in _allowed_starts(a.session):
+                d = day_index_of(t)
+                if not day_ok(a.session.id, d, set()):
+                    continue
+                for r in target_rooms:
+                    if _is_cell_free(a.session, t, r, room_occ, sec_occ, lec_occ):
+                        direct = True
+                        break
+                if direct:
+                    break
+            if not direct:
+                out.append(a)
+        return out
+
+    def fits_rooms(sid):
+        s = by_id[sid].session
+        allow = _allowed_rooms(s, rooms) or []
+        return [r for r in non_hall if r in allow and not _is_no_room(r)]
+
+    attempts = 0
+    moved = 0
+    for _ in range(max_rounds):
+        if attempts >= max_attempts:
+            break
+        targets = stucks()
+        if not targets:
+            break
+        targets.sort(key=lambda a: (a.session.size, a.session.id))
+        round_moved = 0
+        for root in targets:
+            if attempts >= max_attempts:
+                break
+            chain = None
+            queue = [(root.session.id, ())]
+            seen = {root.session.id}
+            qi = 0
+            budget_local = 0
+            while qi < len(queue) and budget_local < 4000:
+                sid, moves = queue[qi]
+                qi += 1
+                displaced = set(i for i, _, _ in moves)
+                s = by_id[sid].session
+                fr = fits_rooms(sid)
+                if not fr:
+                    continue
+                for t in _allowed_starts(s):
+                    d = day_index_of(t)
+                    if not day_ok(sid, d, displaced):
+                        continue
+                    for r in fr:
+                        budget_local += 1
+                        attempts += 1
+                        if attempts > max_attempts:
+                            break
+                        # Full check: room + section + lecturer all clear -> the
+                        # chain can end here on an empty, compliant cell.
+                        if _is_cell_free(s, t, r, room_occ, sec_occ, lec_occ):
+                            chain = moves + ((sid, t, r),)
+                            break
+                        # Otherwise the block is taken: usable as a hop only if
+                        # the room's sole occupant owns every section/lecturer
+                        # slot in the block (so the cell is fully clear once X
+                        # leaves in the chain).
+                        block = None
+                        block_ok = True
+                        arr = room_occ.get(r, [None] * N_SLOTS)
+                        for u in range(t, t + s.duration):
+                            occ = arr[u]
+                            if occ is None:
+                                block_ok = False
+                                break
+                            if block is None:
+                                block = occ
+                            elif occ != block:
+                                block_ok = False
+                                break
+                        if not block_ok:
+                            continue
+                        X = by_id.get(block)
+                        if X is None or is_field(X) or X.session.online:
+                            continue
+                        owner_ok = True
+                        for u in range(t, t + s.duration):
+                            for sec in s.sections:
+                                v = sec_occ.get(sec, [None] * N_SLOTS)[u]
+                                if v is not None and v != X.session.id:
+                                    owner_ok = False
+                                    break
+                            if not owner_ok:
+                                break
+                            lec = s.course.lecturer
+                            if lec:
+                                v = lec_occ.get(lec, [None] * N_SLOTS)[u]
+                                if v is not None and v != X.session.id:
+                                    owner_ok = False
+                                    break
+                        if not owner_ok:
+                            continue
+                        if block in displaced or block in seen:
+                            continue
+                        seen.add(block)
+                        next_m = moves + ((sid, t, r),)
+                        if len(next_m) <= max_depth:
+                            queue.append((block, next_m))
+                    if chain:
+                        break
+                if chain:
+                    break
+            if chain is None:
+                continue
+            for sid, t, r in reversed(chain):
+                by_id[sid].slot, by_id[sid].room = t, r
+            moved += len(chain)
+            round_moved += len(chain)
+            room_occ, sec_occ, lec_occ = refresh()
+            rebuild_secday()
+        if round_moved == 0:
+            break
+
+    leftover = len(stucks())
+    return {
+        "moved": moved,
+        "left_leftover_hall": leftover,
+        "attempts": attempts,
+    }
