@@ -578,14 +578,15 @@ def _same_course_day_count(assignments, session, day):
 
 
 def _find_seat(problem, assignments, session, room_occ, sec_occ, lec_occ, daily_cap,
-               strict_section_day=False):
+               strict_section_day=False, skip_day=None):
     """Non-mutating best-fit seat search feeding the utilisation sweep.
     Returns (room_name, slot) or None. Honours the size-tier rule (TIER_STRICT:
     small/mid must not take a 120-seat hall), _allowed_starts (lunch break,
     Saturday = RT online only, field-work window), the same-course daily cap,
     and the live room/section/lecturer occupancy. With strict_section_day, skips
     any day where a section of this course already has a physical class of the
-    same course (so splits/halves never double-book a section in one day)."""
+    same course (so splits/halves never double-book a section in one day).
+    skip_day excludes one day index (keeps A and B halves of a course apart)."""
     from src.solver import _tier, TIER_STRICT
     need = max(session.size, session.course.min_capacity)
     if TIER_STRICT and _tier(need) <= 2:
@@ -595,6 +596,8 @@ def _find_seat(problem, assignments, session, room_occ, sec_occ, lec_occ, daily_
     dur = session.duration
     for t in _allowed_starts(session):
         d = day_index_of(t)
+        if skip_day is not None and d == skip_day:
+            continue
         if daily_cap and _same_course_day_count(assignments, session, d) >= daily_cap:
             continue
         if strict_section_day:
@@ -684,6 +687,194 @@ def max_utilisation_sweep(problem, assignments):
             continue
         left += 1
     return {"whole": whole, "split": split, "left": left}
+
+
+def fill_free_cells(problem, assignments, skip_lab=None):
+    """Final, fully-deterministic hole-filler. Runs after every other pass, so it
+    only claims room cells that nothing else took.
+
+    Two steps:
+      1. Direct seat: any remaining ONLINE combined row is seated into a free
+         lecture-room cell when its whole duration clears the hard rules
+         (capacity, lunch break, Saturday, section/lecturer occupancy, daily cap,
+         same-course-per-day). 120-seat halls are scanned first.
+      2. Atomic A/B split: a leftover big combined-AB ONLINE row (size > 80) is
+         split into physical A/B halves only when BOTH halves land in the two
+         consecutive cells of a <=80 lecture room at the same day/time. A lone
+         half never ships.
+
+    COMPUTER LAB and other lab-kind rooms are excluded unless allow_lab_overflow
+    is enabled. Returns counters; never creates conflicts."""
+    from src.models import Session as _Session
+    from src.solver import _allowed_starts, _is_split_form
+    overrides = problem.get("overrides") or {}
+    if skip_lab is None:
+        skip_lab = not bool(overrides.get("allow_lab_overflow", False))
+    daily_cap = int(overrides.get("daily_max_sessions") or 3)
+
+    targets = [
+        r for r in problem["rooms"]
+        if r.name not in (ONLINE_ROOM, FIELD_WORK_ROOM) and not (skip_lab and r.kind == "lab")
+    ]
+
+    room_occ, sec_occ, lec_occ = _build_occupancy(assignments, N_SLOTS)
+
+    def same_code_day_count(session, day):
+        return sum(
+            1 for a in assignments
+            if a.room not in (ONLINE_ROOM, FIELD_WORK_ROOM)
+            and a.session.course.code == session.course.code
+            and day_index_of(a.slot) == day
+        )
+
+    def same_day_section_blocked(session, day):
+        for a in assignments:
+            if (a.room not in (ONLINE_ROOM, FIELD_WORK_ROOM)
+                    and day_index_of(a.slot) == day
+                    and a.session.course.code == session.course.code
+                    and a.session.sections.intersection(session.sections)):
+                return True
+        return False
+
+    def place_ok(session, rn, g, growth=1, why=None):
+        need = max(session.size, session.course.min_capacity)
+        cap = next(r.capacity for r in problem["rooms"] if r.name == rn)
+        if need > cap:
+            if why is not None: why.append(f"capacity need={need}>cap={cap}")
+            return False
+        if any(room_occ.get(rn, [None] * N_SLOTS)[u] for u in range(g, g + session.duration)):
+            if why is not None: why.append("room")
+            return False
+        if any((sec_occ.get(sec) or [None] * N_SLOTS)[u]
+               for sec in session.sections for u in range(g, g + session.duration)):
+            if why is not None: why.append("section")
+            return False
+        lec = session.course.lecturer
+        if lec and any((lec_occ.get(lec) or [None] * N_SLOTS)[u] for u in range(g, g + session.duration)):
+            if why is not None: why.append("lecturer")
+            return False
+        if g not in _allowed_starts(session):
+            if why is not None: why.append("allowed_start")
+            return False
+        d0 = day_index_of(g)
+        if same_day_section_blocked(session, d0):
+            if why is not None: why.append("same_day_sec")
+            return False
+        if daily_cap and same_code_day_count(session, d0) + growth > daily_cap:
+            if why is not None: why.append(f"daily_cap cnt={same_code_day_count(session, d0)}")
+            return False
+        return True
+
+    def commit_online(a, rn, g):
+        a.room, a.slot = rn, g
+        for u in range(g, g + a.session.duration):
+            room_occ.setdefault(rn, [None] * N_SLOTS)[u] = a.session.id
+            for sec in a.session.sections:
+                sec_occ.setdefault(sec, [None] * N_SLOTS)[u] = a.session.id
+            if a.session.course.lecturer:
+                lec_occ.setdefault(a.session.course.lecturer, [None] * N_SLOTS)[u] = a.session.id
+
+    counters = {"direct": 0, "split": 0, "rooms_left": 0, "rows_left": 0}
+    hole = room_holes(assignments, problem)
+
+    # ---- step 1: direct seat into any free lecture-room cell ----
+    candidates = [
+        a for a in assignments
+        if a.room == ONLINE_ROOM and a.session.online and not a.session.field_work
+        and not _is_split_form(a.session)
+    ]
+    candidates.sort(key=lambda a: (-a.session.size, a.session.id))
+
+    cells = []
+    for r in targets:
+        for d0 in range(5):
+            for t0 in range(SLOTS_PER_DAY):
+                g = d0 * SLOTS_PER_DAY + t0
+                cells.append((r.capacity, r.name, g))
+    cells.sort(key=lambda c: (-c[0], c[1], c[2]))
+
+    taken = set()
+    for cap, rn, g in cells:
+        if (rn, g) in taken:
+            continue
+        if any(room_occ.get(rn, [None] * N_SLOTS)[u] for u in range(g, g + 1)):
+            continue
+        for a in candidates:
+            if a.session.id in taken:
+                continue
+            s = a.session
+            if cap < max(s.size, s.course.min_capacity):
+                continue
+            if slot_in_day(g) + s.duration > SLOTS_PER_DAY:
+                continue
+            if any(room_occ.get(rn, [None] * N_SLOTS)[u] for u in range(g, g + s.duration)):
+                continue
+            if not place_ok(s, rn, g):
+                continue
+            room_before, slot_before = a.room, a.slot
+            commit_online(a, rn, g)
+            new_holes = room_holes(assignments, problem)
+            if new_holes < hole:
+                hole = new_holes
+                taken.add(a.session.id)
+                counters["direct"] += 1
+            else:
+                a.room, a.slot = room_before, slot_before
+                room_occ, sec_occ, lec_occ = _build_occupancy(assignments, N_SLOTS)
+            break
+
+    # ---- step 2: atomic A/B split into two (possibly different) free seats ----
+    big = [
+        a for a in assignments
+        if a.room == ONLINE_ROOM and a.session.online and not a.session.field_work
+        and len(a.session.sections) == 2 and a.session.size > 80
+    ]
+    big.sort(key=lambda a: (-a.session.size, a.session.id))
+
+    seq = 1100
+    for a in big:
+        if a.session.id in taken:
+            continue
+        s = a.session
+        secs = sorted(s.sections)
+        code_ab = f"{s.course.code}-{s.course.programme}{s.course.level}-AB"
+        ha = _Session(s.course, seq, (s.size + 1) // 2, {secs[0]}, s.duration,
+                      False, s.field_work, code_ab)
+        hb = _Session(s.course, seq + 1, s.size // 2, {secs[1]}, s.duration,
+                      False, s.field_work, code_ab)
+        seq += 2
+        seat_a = _find_seat(problem, assignments, ha, room_occ, sec_occ, lec_occ,
+                            daily_cap, strict_section_day=True)
+        if seat_a is None:
+            continue
+        _commit_seat(assignments, ha, seat_a, room_occ, sec_occ, lec_occ)
+        seat_b = _find_seat(problem, assignments, hb, room_occ, sec_occ, lec_occ,
+                            daily_cap, strict_section_day=True,
+                            skip_day=day_index_of(seat_a[1]))
+        if seat_b is None:
+            assignments[:] = [x for x in assignments if x.session.id != ha.id]
+            room_occ, sec_occ, lec_occ = _build_occupancy(assignments, N_SLOTS)
+            continue
+        _commit_seat(assignments, hb, seat_b, room_occ, sec_occ, lec_occ)
+        assignments.remove(a)
+        new_holes = room_holes(assignments, problem)
+        if new_holes < hole:
+            hole = new_holes
+            counters["split"] += 1
+            taken.add(a.session.id)
+        else:
+            assignments[:] = [x for x in assignments
+                              if x.session.id not in (ha.id, hb.id)]
+            assignments.append(a)
+            room_occ, sec_occ, lec_occ = _build_occupancy(assignments, N_SLOTS)
+
+    counters["rows_left"] = sum(
+        1 for a in assignments
+        if a.room == ONLINE_ROOM and a.session.online and not a.session.field_work
+        and not _is_split_form(a.session)
+    )
+    counters["rooms_left"] = room_holes(assignments, problem)
+    return counters
 
 
 def room_cell_usage(assignments, rooms):
@@ -1144,6 +1335,22 @@ def postprocess(problem, assignments, sem="?"):
     result, remaining = ensure_conflict_free(problem, result)
     if any(remaining[k] for k in ("section", "lecturer", "room")):
         print(f"[{sem}] WARNING: same-day smoothing left conflicts {remaining}", flush=True)
+
+    skip_fill = not bool(((problem.get("overrides") or {})).get("fill_free_cells", True))
+    if skip_fill:
+        print(f"[{sem}] fill_free_cells disabled by settings; skipping hole-fill pass", flush=True)
+    else:
+        before = room_holes(result, problem)
+        fc = fill_free_cells(problem, result)
+        result, remaining = ensure_conflict_free(problem, result)
+        if any(remaining[k] for k in ("section", "lecturer", "room")):
+            print(f"[{sem}] WARNING: fill-free-cell pass left conflicts {remaining}", flush=True)
+        print(
+            f"[{sem}] fill-free-cell pass: direct={fc['direct']} split={fc['split']} "
+            f"rows_left={fc['rows_left']} holes {before} -> {fc['rooms_left']}",
+            flush=True,
+        )
+
     used_cells, total_cells = room_cell_usage(result, problem["rooms"])
     print(
         f"[{sem}] utilisation: {used_cells}/{total_cells} room-slot cells "

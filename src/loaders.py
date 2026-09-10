@@ -602,6 +602,8 @@ SETTINGS_OVERRIDES = {
     "regen_pack_budget": 0,       # seconds for the packing step (0 = pipeline defaults)
     "daily_max_sessions": 3,      # soft cap on scheduled sessions per section per day (0 = no cap)
     "daily_cap_online_fallback": False,  # allow ONLINE fallback to meet the daily cap (costs in-person)
+    "fill_free_cells": True,      # final deterministic pass: seat leftover ONLINE rows into free lecture-room cells
+    "allow_lab_overflow": False,  # if True, lecture classes may use lab-kind rooms to fill holes (e.g. COMPUTER LAB)
 }
 
 
