@@ -978,3 +978,190 @@ def fix_same_day_course(problem, assignments, max_rounds=6, seed=7):
         "over_cap_after": over_after,
         "cap": cap,
     }
+
+
+def spread_modalities(problem, assignments, seed=7, max_rounds=8):
+    """Balance ONLINE and FIELD WORK sessions across the week and cap how many
+    field trips run at the same time.
+
+    Only sessions placed in the ONLINE / FIELD WORK venues are ever moved, so
+    in-person room cells (and thus utilisation / holes) are untouched. A
+    session is moved to a target weekday slot only when:
+
+      * every contained section and the course lecturer are free there,
+      * the section does not already meet the same course that day,
+      * the target day stays under the daily session cap (field work excluded),
+      * for field work, the simultaneous count at the target slot stays at or
+        below field_work_max_simultaneous (default 2).
+
+    Target days are picked to flatten each venue's Mon-Fri profile (lightest
+    day first), with a soft preference to spread a section's own sessions of
+    that venue over different days.
+
+    Mutates Assignment objects in place and returns a dict with online_by_day,
+    field_by_day, max_field_simultaneous, field_simultaneous_penalty, moves and
+    fw_max_setting.
+    """
+    overrides = problem.get("overrides") or {}
+    fw_max = int(overrides.get("field_work_max_simultaneous") or 2)
+    cap = int(overrides.get("daily_max_sessions") or 3)
+    if cap <= 0:
+        cap = 3
+    work_days = len(DAYS) - 1  # Mon-Fri; Saturday stays virtual-only
+    rng = random.Random(seed)
+
+    sec_occ = {}
+    lec_occ = {}
+
+    def slots_of(a):
+        return range(a.slot, a.slot + a.session.duration)
+
+    def add(a):
+        s = a.session
+        for u in slots_of(a):
+            for sec in s.sections:
+                sec_occ.setdefault((sec, u), set()).add(s.id)
+            if s.course.lecturer:
+                lec_occ.setdefault((s.course.lecturer, u), set()).add(s.id)
+
+    def remove(a):
+        s = a.session
+        for u in slots_of(a):
+            for sec in s.sections:
+                if (sec, u) in sec_occ:
+                    sec_occ[(sec, u)].discard(s.id)
+            if s.course.lecturer and (s.course.lecturer, u) in lec_occ:
+                lec_occ[(s.course.lecturer, u)].discard(s.id)
+
+    def venue(a):
+        if a.room == ONLINE_ROOM:
+            return 0
+        if a.room == FIELD_WORK_ROOM:
+            return 1
+        return None
+
+    def is_field(a):
+        return a.session.field_work or a.room == FIELD_WORK_ROOM
+
+    for a in assignments:
+        add(a)
+
+    counts = [[0] * work_days for _ in range(2)]
+    fw_at = [0] * N_SLOTS
+    for a in assignments:
+        v = venue(a)
+        if v is None:
+            continue
+        d = day_index_of(a.slot)
+        if d < work_days:
+            counts[v][d] += 1
+        if v == 1:
+            for u in slots_of(a):
+                fw_at[u] += 1
+
+    allowed_start_set = set()
+    for a in assignments:
+        allowed_start_set.update(_allowed_starts(a.session))
+
+    def same_course_day_free(a, d):
+        code = a.session.course.code
+        for b in assignments:
+            if b.session.id == a.session.id or day_index_of(b.slot) != d:
+                continue
+            if b.session.course.code == code and b.session.sections.intersection(a.session.sections):
+                return False
+        return True
+
+    def day_under_cap(a, d):
+        for sec in a.session.sections:
+            n = 0
+            for b in assignments:
+                if b.session.id == a.session.id or is_field(b) or day_index_of(b.slot) != d:
+                    continue
+                if sec in b.session.sections:
+                    n += 1
+            if n >= cap:
+                return False
+        return True
+
+    def sec_lec_free(a, t):
+        for u in range(t, t + a.session.duration):
+            for sec in a.session.sections:
+                if sec_occ.get((sec, u)):
+                    return False
+            lec = a.session.course.lecturer
+            if lec and lec_occ.get((lec, u)):
+                return False
+        return True
+
+    def field_slot_free(a, t):
+        for u in range(t, t + a.session.duration):
+            if fw_at[u] + 1 > fw_max:
+                return False
+        return True
+
+    def section_venue_count(a, v, d):
+        return sum(1 for b in assignments
+                   if venue(b) == v and day_index_of(b.slot) == d
+                   and b.session.sections.intersection(a.session.sections))
+
+    def iter_day_slots(d):
+        lo = d * SLOTS_PER_DAY
+        for t in range(lo, lo + SLOTS_PER_DAY):
+            if t in allowed_start_set:
+                yield t
+
+    moved = 0
+    for _ in range(max_rounds):
+        cands = [a for a in assignments
+                 if venue(a) is not None and day_index_of(a.slot) < work_days]
+        rng.shuffle(cands)
+        progress = False
+        for a in cands:
+            v = venue(a)
+            cur = day_index_of(a.slot)
+            sectioned_cur = section_venue_count(a, v, cur) > 1
+
+            def target_key(d):
+                gain = counts[v][d] < counts[v][cur] or sectioned_cur
+                return (0 if gain else 1, counts[v][d], d)
+
+            planned = None
+            for d in sorted((d for d in range(work_days) if d != cur), key=target_key):
+                if not same_course_day_free(a, d) or not day_under_cap(a, d):
+                    continue
+                for t in iter_day_slots(d):
+                    if not sec_lec_free(a, t):
+                        continue
+                    if v == 1 and not field_slot_free(a, t):
+                        continue
+                    planned = t
+                    break
+                if planned is not None:
+                    break
+            if planned is None:
+                continue
+            old = a.slot
+            remove(a)
+            a.slot = planned
+            add(a)
+            counts[v][cur] -= 1
+            counts[v][day_index_of(planned)] += 1
+            if v == 1:
+                for u in range(old, old + a.session.duration):
+                    fw_at[u] -= 1
+                for u in range(planned, planned + a.session.duration):
+                    fw_at[u] += 1
+            moved += 1
+            progress = True
+        if not progress:
+            break
+
+    return {
+        "online_by_day": list(counts[0]),
+        "field_by_day": list(counts[1]),
+        "max_field_simultaneous": max(fw_at),
+        "field_simultaneous_penalty": sum(max(0, c - fw_max) for c in fw_at),
+        "moves": moved,
+        "fw_max_setting": fw_max,
+    }

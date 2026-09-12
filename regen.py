@@ -4,7 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from src.paths import PROJECT_ROOT, DATA_DIR, OUTPUT_DIR
 from src.loaders import load_problem, list_semesters
-from src.solver import load_solution_json, repair_assignments, _verify, Assignment, ONLINE_ROOM, FIELD_WORK_ROOM, _allowed_starts, _allowed_rooms, _is_split_form, _is_combined_form, unit_base, fix_same_day_course
+from src.solver import load_solution_json, repair_assignments, _verify, Assignment, ONLINE_ROOM, FIELD_WORK_ROOM, _allowed_starts, _allowed_rooms, _is_split_form, _is_combined_form, unit_base, fix_same_day_course, spread_modalities
 from src.slots import DAYS, SLOTS_PER_DAY, N_SLOTS, day_index_of, slot_in_day
 from src.compact import compact, fill_online_rooms
 from src.pack import pack, Packer
@@ -20,12 +20,28 @@ WORKER = str(Path(__file__).resolve().parent / "regen_worker.py")
 WORK = Path(tempfile.gettempdir()) / "umat-tt"
 os.makedirs(WORK, exist_ok=True)
 
+DEFAULT_SPREAD_SEEDS = [7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73, 79, 83, 89, 97]
+
+
+def spread_seeds(problem):
+    """Orderings of the dup-residual / modality spread passes (settings
+    spread_seeds). Deterministic - no full re-solve, just shuffled traversal."""
+    val = (problem.get("overrides") or {}).get("spread_seeds")
+    if isinstance(val, list) and val:
+        try:
+            return [int(s) for s in val]
+        except (TypeError, ValueError):
+            pass
+    return DEFAULT_SPREAD_SEEDS
+
 
 def run_phase(sem, phase, time_limit, in_path, out_path, seed, mode="plain", grace=180):
     if os.path.exists(out_path):
         os.remove(out_path)
     cmd = [PY, "-u", WORKER, sem, phase, str(time_limit), in_path or "none", out_path, str(seed), str(mode)]
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
+    env = dict(os.environ, PYTHONHASHSEED="0")
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, encoding="utf-8", errors="replace", env=env)
     deadline = time.time() + time_limit + grace
     line = None
     while time.time() < deadline:
@@ -75,20 +91,24 @@ def gap_slots(assignments, problem):
 
 
 def room_holes(assignments, problem):
+    """Total unused hour-cells in the physical rooms across Mon-Fri.
+
+    Every free cell is a hole - morning, afternoon, evening, trailing edges and
+    fully-idle days alike - because each one is a cell of non-utilisation in a
+    room (user directive).  Virtual venues (ONLINE / FIELD WORK) are never
+    holes; they are not physical classrooms."""
     from src.slots import SLOTS_PER_DAY, day_index_of, slot_in_day
     total = 0
     for room in problem["rooms"]:
+        if room.name in (ONLINE_ROOM, FIELD_WORK_ROOM):
+            continue
         for d in range(5):
             occ = set()
             for a in assignments:
                 if a.room == room.name and day_index_of(a.slot) == d:
                     for k in range(a.session.duration):
                         occ.add(slot_in_day(a.slot) + k)
-            occ = sorted(occ)
-            if len(occ) < 2:
-                continue
-            first, last = occ[0], occ[-1]
-            total += sum(1 for s in range(first + 1, last) if s not in occ)
+            total += SLOTS_PER_DAY - len(occ)
     return total
 
 
@@ -129,12 +149,13 @@ def run(sem):
     out1 = WORK / f"solve_{sem}_p1.json"
     hints_path = str(OUTPUT_DIR / f"_{sem}_tt" / "initial_solution.json")
     phase1_limit = int(problem["overrides"].get("phase1_time_limit") or 240)
+    regen_seed = int(problem["overrides"].get("regen_seed") or 7)
 
     phase1_done = False
     for mode in ("tight", "plain"):
         label = "tight (no halls for small/mid classes)" if mode == "tight" else "plain"
         print(f"[{sem}] phase1 mode={label} (hints) ...", flush=True)
-        for seed in (42, 7):
+        for seed in dict.fromkeys((regen_seed, 42, 7)):
             print(f"[{sem}] phase1 seed={seed} ...", flush=True)
             rc, _ = run_phase(sem, "1", phase1_limit, hints_path, out1, seed, mode=mode)
             status, obj, assign1 = best_solution(out1, sessions)
@@ -1133,7 +1154,7 @@ def room_cell_usage(assignments, rooms):
 
 def postprocess(problem, assignments, sem="?"):
     """Repair, compact, fill online rooms, then pack + chain-fill (keep best of
-    4 trials), rebalance, and finally force-repair section/lecturer overlaps so
+    K trials), rebalance, and finally force-repair section/lecturer overlaps so
     the result ships conflict-free. Returns the final assignment list. Mutates
     clones of the input."""
     problem["soft_sections"] = False
@@ -1164,18 +1185,23 @@ def postprocess(problem, assignments, sem="?"):
     fill_online_rooms(problem, result, time_budget=15)
     compact(problem, result, time_budget=15)
 
-    print(f"[{sem}] pack (keep best of trials) ...", flush=True)
-    best_assign, best_holes = None, None
-    for i in range(2):
+    ov = problem.get("overrides") or {}
+    regen_seed = int(ov.get("regen_seed") or 7)
+    best_of = int(ov.get("best_of_trials") or 5)
+    print(f"[{sem}] pack (best-of-{best_of}, seed={regen_seed}) ...", flush=True)
+    best_assign, best_key = None, None
+    for i in range(best_of):
         cand = clone_assign(result)
-        rng = random.Random(random.randint(1, 2**31 - 1))
-        for _ in range(2):
+        rng = random.Random(regen_seed * 1000 + i)
+        for _ in range(best_of):
             pack(problem, cand, time_budget=15, rng=rng)
             Packer(problem, cand, rng=rng).fill_holes(max_depth=4)
         holes = room_holes(cand, problem)
-        print(f"[{sem}] pack trial {i + 1}: room idle holes={holes}", flush=True)
-        if best_holes is None or holes < best_holes:
-            best_assign, best_holes = cand, holes
+        used = room_cell_usage(cand, problem["rooms"])[0]
+        key = (holes, -used)
+        print(f"[{sem}] pack trial {i + 1}: room idle holes={holes} (cells used={used})", flush=True)
+        if best_key is None or key < best_key:
+            best_assign, best_key = cand, key
     result = best_assign
 
     print(f"[{sem}] rebalance room-day loads ...", flush=True)
@@ -1493,9 +1519,10 @@ def postprocess(problem, assignments, sem="?"):
     # budget, shuffled traversal). Run the same layout through several shuffle
     # orders and keep the one with the fewest duplicates - deterministic, no
     # full re-solve.
-    print(f"[{sem}] best-of-K spread (same layout, 5 shuffle orders) ...", flush=True)
+    seeds = spread_seeds(problem)
+    print(f"[{sem}] best-of-K spread (same layout, {len(seeds)} shuffle orders) ...", flush=True)
     best = None
-    for kseed in (7, 11, 13, 17, 19):
+    for kseed in seeds:
         snapshot = [(a, a.slot, a.room) for a in result]
         stat = fix_same_day_course(problem, result, seed=kseed)
         mixed = _verify(result, problem).get("mixed_course", 0)
@@ -1588,6 +1615,42 @@ def postprocess(problem, assignments, sem="?"):
             f"rows_left={fc['rows_left']} holes {before} -> {fc['rooms_left']}",
             flush=True,
         )
+
+    # Modality balance: spread ONLINE and FIELD WORK sessions across the week
+    # (so online / field work do not collapse toward Friday) and cap how many
+    # field trips run in the same slot. Only virtual-venue sessions move, so
+    # utilisation and holes are untouched. Same best-of-K pattern as the
+    # dup-residual spread above.
+    if bool(((problem.get("overrides") or {})).get("spread_modalities", True)):
+        seeds = spread_seeds(problem)
+        print(f"[{sem}] spread online/field-work across the week (best-of-{len(seeds)}) ...", flush=True)
+        best = None
+        for kseed in seeds:
+            snapshot = [(a, a.slot, a.room) for a in result]
+            stat = spread_modalities(problem, result, seed=kseed)
+            key = (
+                stat["field_simultaneous_penalty"],
+                max(stat["online_by_day"]) - min(stat["online_by_day"]),
+                max(stat["field_by_day"]) - min(stat["field_by_day"]),
+            )
+            if best is None or key < best[0]:
+                best = (key, kseed, stat)
+            else:
+                for a, sl, rr in snapshot:
+                    a.slot, a.room = sl, rr
+        stat = best[2]
+        print(
+            f"[{sem}] modality best-of-K: seed={best[1]} | moves={stat['moves']} | "
+            f"online by day={stat['online_by_day']} | field by day={stat['field_by_day']} | "
+            f"max simultaneous field={stat['max_field_simultaneous']} "
+            f"(cap={stat['fw_max_setting']})",
+            flush=True,
+        )
+        result, remaining = ensure_conflict_free(problem, result)
+        if any(remaining[k] for k in ("section", "lecturer", "room")):
+            print(f"[{sem}] WARNING: modality spread left conflicts {remaining}", flush=True)
+        else:
+            print(f"[{sem}] conflict-free after modality spread", flush=True)
 
     used_cells, total_cells = room_cell_usage(result, problem["rooms"])
     print(

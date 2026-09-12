@@ -19,6 +19,17 @@ data/semesters/*/courses.collapsed.xlsx
 data/semesters/*/courses.presplit.xlsx
 data/semesters/*/courses.split813.xlsx
 
+# Regeneration backups
+data/*.prefix.xlsx
+data/semesters/*/*.prefix.xlsx
+data/semesters/*/*.pre-fix.xlsx
+data/semesters/*/*.bak
+data/semesters/*/*.bak2
+data/semesters/*/*.pre-collapse.bak
+
+# Stray phase-1 solver artifacts
+output/sem*/solve_*_p1_*.json
+
 node_modules/
 .vercel/
 .docker/

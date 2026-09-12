@@ -604,6 +604,11 @@ SETTINGS_OVERRIDES = {
     "daily_cap_online_fallback": False,  # allow ONLINE fallback to meet the daily cap (costs in-person)
     "fill_free_cells": True,      # final deterministic pass: seat leftover ONLINE rows into free lecture-room cells
     "allow_lab_overflow": False,  # if True, lecture classes may use lab-kind rooms to fill holes (e.g. COMPUTER LAB)
+    "regen_seed": 7,              # master rng seed for reproducible regeneration (pack trials, repairs)
+    "best_of_trials": 5,          # pack best-of-K trials; keep fewest room holes (tie -> higher utilisation)
+    "spread_modalities": True,    # balance ONLINE and FIELD WORK sessions across the week (virtual venue only)
+    "field_work_max_simultaneous": 2,  # cap simultaneous field-work sessions per slot
+    "spread_seeds": [7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73, 79, 83, 89, 97],
 }
 
 
