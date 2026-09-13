@@ -152,7 +152,7 @@ def run(sem):
     regen_seed = int(problem["overrides"].get("regen_seed") or 7)
 
     phase1_done = False
-    for mode in ("tight", "plain"):
+    for mode in ("plain",):
         label = "tight (no halls for small/mid classes)" if mode == "tight" else "plain"
         print(f"[{sem}] phase1 mode={label} (hints) ...", flush=True)
         for seed in dict.fromkeys((regen_seed, 42, 7)):
@@ -161,13 +161,11 @@ def run(sem):
             status, obj, assign1 = best_solution(out1, sessions)
             if assign1:
                 phase1_done = True
-                phase1_mode = mode
                 print(f"[{sem}] phase1 mode={mode} seed={seed} recovered status={status} sessions={len(assign1)}", flush=True)
                 break
             print(f"[{sem}] phase1 mode={mode} seed={seed} found nothing", flush=True)
         if phase1_done:
             break
-        print(f"[{sem}] phase1 mode={mode} unsolvable - falling back to plain feasibility", flush=True)
     if not phase1_done:
         print(f"[{sem}] ABORT: no phase1 solution found", flush=True)
         print(
