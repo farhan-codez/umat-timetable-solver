@@ -587,9 +587,6 @@ function summaryCards(sum) {
   const wrap = $("summary");
   if (!sum || !sum.status) { wrap.replaceChildren(); return; }
   const cards = [];
-  const ok = sum.status.startsWith("OPTIMAL") || sum.status.startsWith("FEASIBLE");
-  cards.push({ k: "Status", v: sum.status, cls: ok ? "good" : (sum.status === "INFEASIBLE" ? "bad" : "") });
-  cards.push({ k: "Objective", v: sum.objective === null || sum.objective === undefined ? "\u2014" : sum.objective });
   cards.push({ k: "Sessions", v: sum.sessions ?? "\u2014" });
   cards.push({ k: "Rooms", v: sum.rooms ?? "\u2014" });
   const totalConf = sum.conflicts ? Object.values(sum.conflicts).reduce((a, b) => a + b, 0) : 0;
@@ -1087,8 +1084,6 @@ function renderSolveLive(job) {
   }
   const parts = [];
   if (live.phase) parts.push(live.phase === "phase1" ? "Phase 1 - conflict-free layout" : "Phase 2 - optimisation");
-  if (typeof live.objective === "number") parts.push(`objective ${Math.round(live.objective)}`);
-  if (typeof live.bound === "number" && live.bound !== live.objective) parts.push(`best bound ${Math.round(live.bound)}`);
   if (typeof live.conflicts === "number") parts.push(`${live.conflicts} search nodes`);
   if (typeof live.elapsed === "number") parts.push(`solver ${Math.floor(live.elapsed / 60)}m ${String(Math.floor(live.elapsed) % 60).padStart(2, "0")}s`);
   el.textContent = parts.join("  \u00b7  ");
@@ -1127,7 +1122,7 @@ async function runSolve() {
         if (job.ok) {
           $("solve-status").className = "status done";
           $("solve-status").textContent =
-            `Solve complete: ${job.summary.status} (objective ${job.summary.objective ?? "\u2014"})` +
+            "Timetable generated" +
             (job.summary.built_from ? ` \u00b7 Built from ${job.summary.built_from}` : "") +
             (job.note ? ` \u00b7 ${job.note}` : "");
           $("solve-text").textContent = "Loading timetable...";
