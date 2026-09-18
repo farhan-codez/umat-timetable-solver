@@ -803,13 +803,20 @@ def _run_solve(job_id, time_limit, semester):
             job["progress"] = "Solving..."
             job["live"] = {"phase": "phase1", "elapsed": 0}
             log.info("solve start semester=%s time_limit=%s", semester, time_limit)
-            # Feasibility-only solve with hard section/lecturer/room constraints:
-            # any returned solution is already conflict-free. A second pass with
-            # an optimization objective is intentionally skipped - on this data
-            # CP-SAT cannot even finish presolve for that model within minutes.
-            phase1 = solve(problem, time_limit=min(max(time_limit, 120), 300),
-                           minimize_objective=False, feasibility_jump=True, seed=random.randint(1, 2**31 - 1), progress_cb=live_cb("phase1"))
-            result = phase1
+            # Fast greedy solver (much faster than CP-SAT for this data)
+            from fast_solver import greedy_phase1
+            assignments = greedy_phase1(problem, time_limit=min(max(time_limit, 60), 300), seed=random.randint(1, 2**31 - 1))
+            
+            # Convert to result-like object
+            from src.solver import _verify
+            class GreedyResult:
+                def __init__(self, assignments, problem):
+                    self.assignments = assignments
+                    self.checks = _verify(assignments, problem)
+                    self.status = "FEASIBLE" if assignments else "NO SOLUTION"
+                    self.objective = 0
+            
+            result = GreedyResult(assignments, problem)
             if result.status in ("OPTIMAL", "FEASIBLE"):
                 from regen import postprocess
                 job["progress"] = "Packing sessions together (reducing idle gaps)..."
