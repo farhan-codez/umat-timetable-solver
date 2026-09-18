@@ -13,7 +13,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import src.extract as ex
 from src.loaders import load_problem
-from src.solver import Assignment, _verify
+from src.solver import Assignment, _verify, _is_no_room
 from src.slots import DAYS, SLOT_TIMES, SLOTS_PER_DAY
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -131,29 +131,49 @@ def build_hints(sem, sub, fn, data_dir):
     # The school's real timetable contains its own section/lecturer conflicts.
     # A hinted session is pinned to its exact (slot, room) later (fix_hinted),
     # so any conflicted hint would force a conflict into the solution. Drop
-    # every hinted session involved in a section OR lecturer conflict; the
-    # solver will place those sessions itself.
-    sec_seen = defaultdict(list)
-    lec_seen = defaultdict(list)
-    conflicted = set()
-    for a in assignments:
-        for u in range(a.slot, a.slot + a.session.duration):
+    # every hinted session involved in a section / lecturer / room / same-day
+    # conflict (the solver's same-course-per-day rule covers online too),
+    # iterating to a fixpoint; the solver will place those sessions itself.
+    def conflict_sessions(assigns):
+        sec_seen = defaultdict(list)
+        lec_seen = defaultdict(list)
+        room_seen = defaultdict(list)
+        day_seen = defaultdict(set)
+        bad = set()
+        for a in assigns:
+            for u in range(a.slot, a.slot + a.session.duration):
+                for sec in a.session.sections:
+                    if sec_seen[(sec, u)]:
+                        bad.update(x.session.id for x in sec_seen[(sec, u)])
+                        bad.add(a.session.id)
+                    sec_seen[(sec, u)].append(a)
+                lec = a.session.course.lecturer
+                if lec:
+                    if lec_seen[(lec, u)]:
+                        bad.update(x.session.id for x in lec_seen[(lec, u)])
+                        bad.add(a.session.id)
+                    lec_seen[(lec, u)].append(a)
+                if not _is_no_room(a.room):
+                    if room_seen[(a.room, u)]:
+                        bad.update(x.session.id for x in room_seen[(a.room, u)])
+                        bad.add(a.session.id)
+                    room_seen[(a.room, u)].append(a)
+            day = a.slot // SLOTS_PER_DAY
             for sec in a.session.sections:
-                if sec_seen[(sec, u)]:
-                    conflicted.update(x.session.id for x in sec_seen[(sec, u)])
-                    conflicted.add(a.session.id)
-                sec_seen[(sec, u)].append(a)
-            lec = a.session.course.lecturer
-            if lec:
-                if lec_seen[(lec, u)]:
-                    conflicted.update(x.session.id for x in lec_seen[(lec, u)])
-                    conflicted.add(a.session.id)
-                lec_seen[(lec, u)].append(a)
-    if conflicted:
+                if (a.session.course.code, sec) in day_seen:
+                    if day in day_seen[(a.session.course.code, sec)]:
+                        bad.add(a.session.id)
+                day_seen[(a.session.course.code, sec)].add(day)
+        return bad
+
+    while True:
+        conflicted = conflict_sessions(assignments)
+        if not conflicted:
+            break
         before = len(assignments)
         assignments = [a for a in assignments if a.session.id not in conflicted]
-        print(f"{sem}: dropped {before - len(assignments)} hinted sessions involved in "
-              f"section/lecturer conflicts ({len(conflicted)} sessions)")
+        print(f"{sem}: dropped {before - len(assignments)} hinted sessions (conflicts "
+              f"{len(conflicted)} sessions)")
 
     checks = _verify(assignments, problem)
     print(f"{sem}: clean hint set: hinted={len(assignments)} "

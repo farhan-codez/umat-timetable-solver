@@ -40,6 +40,7 @@ class Course:
     min_capacity: int
     field_work: bool = False
     seq: int = 0  # unique per course row; keeps session ids distinct across duplicate rows
+    saturday_online: bool = False  # allowed to run ONLINE on Saturday (settings: saturday_online_codes)
 
 
 @dataclass

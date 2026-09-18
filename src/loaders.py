@@ -609,6 +609,7 @@ SETTINGS_OVERRIDES = {
     "spread_modalities": True,    # balance ONLINE and FIELD WORK sessions across the week (virtual venue only)
     "field_work_max_simultaneous": 2,  # cap simultaneous field-work sessions per slot
     "spread_seeds": [7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73, 79, 83, 89, 97],
+    "saturday_online_codes": [],  # course-code prefixes allowed to run ONLINE on Saturday (e.g. ["RT"]); empty = never
 }
 
 
@@ -672,6 +673,11 @@ def load_problem(data_dir):
         split_combined_above=overrides["split_combined_above"],
     )
     weights = load_settings(data_dir)
+
+    sat_online = [p for p in overrides.get("saturday_online_codes", []) if p]
+    for s in sessions:
+        if s.online and any(s.course.code.startswith(p) for p in sat_online):
+            s.course.saturday_online = True
 
     sections = sorted(cohorts.keys())
     lecturers = sorted({s.course.lecturer for s in sessions if s.course.lecturer})

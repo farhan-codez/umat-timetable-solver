@@ -25,7 +25,7 @@ EVENING_START = 10
 # campus, so they are only allowed to start in the middle of the day: never at
 # the early 06:30/07:30 blocks and never in the evening.
 FIELD_WORK_START_MIN = 2   # 08:30-09:30
-FIELD_WORK_START_MAX = 9   # 16:00-17:00 (a 2h session ends by 18:00; 1h by 17:00)
+FIELD_WORK_START_MAX = 8   # 15:00-17:00 (2h ends by 17:00; 1h by 16:00)
 
 SLOTS_PER_DAY = len(SLOT_TIMES)
 N_SLOTS = len(DAYS) * SLOTS_PER_DAY

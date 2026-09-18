@@ -393,33 +393,70 @@ function tableFor(kind) {
       sel.appendChild(new Option("-- none --", ""));
       const myProg = String(r.programme || "").trim();
       const myLv = String(r.level || "").trim();
-      const taken = new Set();
-      state.courses.forEach((other) => {
-        if (other === r) return;
-        if (other.linked_course) taken.add(other.course_code);
-      });
+      const myGroup = (r.group_id || "").trim();
       state.courses.forEach((other) => {
         if (other === r) return;
         if (String(other.programme || "").trim() === myProg) return;
         if (String(other.level || "").trim() !== myLv) return;
-        if (taken.has(other.course_code) && other.course_code !== r.linked_course) return;
-        const label = `${other.course_code} (${other.programme})`;
-        sel.appendChild(new Option(label, other.course_code));
+        const otherGroup = (other.group_id || "").trim();
+        if (otherGroup && otherGroup === myGroup) {
+          sel.appendChild(new Option(`${other.course_code} (${other.programme})`, other.course_code));
+          return;
+        }
+        if (!other.linked_course && !otherGroup) {
+          sel.appendChild(new Option(`${other.course_code} (${other.programme})`, other.course_code));
+        }
       });
       sel.value = r.linked_course || "";
       if (!authToken) { sel.disabled = true; sel.tabIndex = -1; }
       sel.addEventListener("change", () => {
         const target = sel.value;
-        const old = state[kind][i].linked_course;
-        if (old && old !== target) {
-          const oi = state.courses.findIndex((c) => c.course_code === old);
-          if (oi >= 0) state.courses[oi].linked_course = "";
-        }
-        state[kind][i].linked_course = target;
-        if (target) {
+        const myOldGroup = (state[kind][i].group_id || "").trim();
+        if (!target) {
+          state[kind][i].linked_course = "";
+          state[kind][i].group_id = "";
+          state[kind][i].sections = sectionsForCourse(state[kind][i]);
+          state[kind][i].course_name = state[kind][i].course_code;
+          if (myOldGroup) {
+            const mates = state.courses.filter((c, ci) => ci !== i && (c.group_id || "").trim() === myOldGroup);
+            if (mates.length === 1) {
+              mates[0].linked_course = "";
+              mates[0].group_id = "";
+              mates[0].sections = sectionsForCourse(mates[0]);
+              mates[0].course_name = mates[0].course_code;
+            }
+          }
+        } else {
           const ti = state.courses.findIndex((c) => c.course_code === target);
-          if (ti >= 0) state.courses[ti].linked_course = r.course_code;
+          if (ti < 0) return;
+          const theirGroup = (state.courses[ti].group_id || "").trim();
+          let gid = theirGroup;
+          if (!gid && myOldGroup) {
+            gid = myOldGroup;
+          } else if (!gid) {
+            gid = "link-" + [r.course_code, target].sort().join("-").replace(/\s+/g, "-").toLowerCase();
+          }
+          const chainIndices = [];
+          state.courses.forEach((c, ci) => {
+            const cg = (c.group_id || "").trim();
+            if (cg === gid || (myOldGroup && cg === myOldGroup)) chainIndices.push(ci);
+          });
+          chainIndices.push(i);
+          if (ti >= 0 && !chainIndices.includes(ti)) chainIndices.push(ti);
+          const uniqueIndices = [...new Set(chainIndices)];
+          const allSecs = new Set();
+          uniqueIndices.forEach((ci2) => {
+            state.courses[ci2].group_id = gid;
+            (state.courses[ci2].sections || sectionsForCourse(state.courses[ci2])).split(",").filter(Boolean).forEach((s) => allSecs.add(s));
+          });
+          const mergedSecs = [...allSecs].sort().join(",");
+          const nameParts = uniqueIndices.map((ci2) => state.courses[ci2].course_code).join("/");
+          uniqueIndices.forEach((ci2) => {
+            state.courses[ci2].sections = mergedSecs;
+            state.courses[ci2].course_name = nameParts;
+          });
         }
+        markLinkedCourses();
         tableFor(kind);
       });
       tdLink.appendChild(sel);
@@ -546,24 +583,36 @@ function wire(kind) {
       let payload = state[kind];
       if (kind === "courses") {
         payload = state[kind].map((r) => ({ ...r }));
-        const linkedPairs = new Set();
+        const processed = new Set();
         payload.forEach((r) => {
           const target = r.linked_course;
-          if (!target) return;
-          const pairKey = [r.course_code, target].sort().join("|");
-          if (linkedPairs.has(pairKey)) return;
-          linkedPairs.add(pairKey);
-          const ti = payload.findIndex((c) => c.course_code === target);
-          if (ti < 0) return;
-          const gid = `link-${r.course_code}-${target}`.replace(/\s+/g, "-").toLowerCase();
-          r.group_id = gid;
-          payload[ti].group_id = gid;
-          const mySecs = (r.sections || sectionsForCourse(r)).split(",").filter(Boolean);
-          const theirSecs = (payload[ti].sections || sectionsForCourse(payload[ti])).split(",").filter(Boolean);
-          r.sections = [...new Set([...mySecs, ...theirSecs])].sort().join(",");
-          payload[ti].sections = r.sections;
-          r.course_name = `${r.course_code}/${target}`;
-          payload[ti].course_name = r.course_name;
+          if (!target || processed.has(r.course_code)) return;
+          const chain = [r.course_code];
+          let cur = target;
+          while (cur && cur !== r.course_code && !processed.has(cur)) {
+            chain.push(cur);
+            processed.add(cur);
+            const ci = payload.findIndex((c) => c.course_code === cur);
+            cur = ci >= 0 ? payload[ci].linked_course : null;
+          }
+          processed.add(r.course_code);
+          const gid = "link-" + chain.sort().join("-").replace(/\s+/g, "-").toLowerCase();
+          const allSecs = new Set();
+          chain.forEach((code) => {
+            const pi = payload.findIndex((c) => c.course_code === code);
+            if (pi < 0) return;
+            payload[pi].group_id = gid;
+            (payload[pi].sections || sectionsForCourse(payload[pi])).split(",").filter(Boolean).forEach((s) => allSecs.add(s));
+          });
+          const mergedSecs = [...allSecs].sort().join(",");
+          const nameParts = chain.join("/");
+          chain.forEach((code) => {
+            const pi = payload.findIndex((c) => c.course_code === code);
+            if (pi >= 0) {
+              payload[pi].sections = mergedSecs;
+              payload[pi].course_name = nameParts;
+            }
+          });
         });
         payload.forEach((r) => { delete r.linked_course; });
       }
@@ -1174,10 +1223,11 @@ function markLinkedCourses() {
     if (g) { gidMap[g] = gidMap[g] || []; gidMap[g].push(i); }
   });
   Object.values(gidMap).forEach((indices) => {
-    if (indices.length !== 2) return;
-    const [a, b] = indices;
-    state.courses[a].linked_course = state.courses[b].course_code;
-    state.courses[b].linked_course = state.courses[a].course_code;
+    if (indices.length < 2) return;
+    for (let k = 0; k < indices.length; k++) {
+      const next = (k + 1) % indices.length;
+      state.courses[indices[k]].linked_course = state.courses[indices[next]].course_code;
+    }
   });
 }
 

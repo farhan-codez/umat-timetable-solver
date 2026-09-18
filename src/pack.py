@@ -48,6 +48,7 @@ class Packer:
     def __init__(self, problem, assignments, debug=False, allow_plateau=False, rng=None):
         import random
         self.sessions = problem["sessions"]
+        self.rooms = problem["rooms"]
         self.debug = debug
         self.allow_plateau = allow_plateau
         self.tie_eps = 0.001 if allow_plateau else 0.0
@@ -109,6 +110,8 @@ class Packer:
         return holes
 
     def _remove(self, s):
+        if s.id not in self.assign:
+            return
         a = self.assign[s.id]
         slots = range(a.slot, a.slot + s.duration)
         for sec in s.sections:
@@ -142,6 +145,8 @@ class Packer:
         return True
 
     def _place(self, s, t, r):
+        if s.id not in self.assign:
+            return
         a = self.assign[s.id]
         slots = range(t, t + s.duration)
         for sec in s.sections:
@@ -185,6 +190,8 @@ class Packer:
                             raise SystemExit
 
     def _score_relocate(self, s, t, r):
+        if s.id not in self.assign:
+            return float('inf')
         a = self.assign[s.id]
         old = range(a.slot, a.slot + s.duration)
         new = range(t, t + s.duration)
@@ -204,6 +211,8 @@ class Packer:
         sessions = list(self.sessions)
         self.rng.shuffle(sessions)
         for s in sessions:
+            if s.id not in self.assign:
+                continue
             a = self.assign[s.id]
             if getattr(s, "fixed_slot", None) is not None:
                 continue
@@ -301,6 +310,8 @@ class Packer:
             for s2 in self.sessions:
                 if s2.id == sid:
                     continue
+                if s2.id not in self.assign:
+                    continue
                 a2 = self.assign[s2.id]
                 if getattr(s2, "fixed_slot", None) is not None:
                     continue
@@ -376,6 +387,8 @@ class Packer:
             if t not in self.starts[s.id] or r not in self.allowed[s.id]:
                 continue
             if not self._free(s, t, r):
+                continue
+            if s.id not in self.assign:
                 continue
             a = self.assign[s.id]
             old_t, old_r = a.slot, a.room
@@ -459,7 +472,7 @@ class Packer:
         best_placed = -1
         best_assign = None
         online_sessions = [s for s in self.sessions
-                           if s.online and self.assign[s.id].room == ONLINE_ROOM]
+                           if s.online and s.id in self.assign and self.assign[s.id].room == ONLINE_ROOM]
         if not online_sessions:
             return 0, None
         # Order by constrainedness (fewest candidate homes first)
@@ -497,6 +510,8 @@ class Packer:
             ordered = sorted(online_sessions, key=lambda s: (constrainedness(s), self.rng.random()))
             placed = 0
             for s in ordered:
+                if s.id not in self.assign:
+                    continue
                 a = self.assign[s.id]
                 if a.room != ONLINE_ROOM:
                     continue  # already placed by earlier online session in this restart
@@ -571,7 +586,7 @@ class Packer:
                         break
                 if best_chain:
                     # Save original positions for rollback (blockers + online session)
-                    original = {bid: (self.assign[bid].slot, self.assign[bid].room) for bid in best_chain}
+                    original = {bid: (self.assign[bid].slot, self.assign[bid].room) for bid in best_chain if bid in self.assign}
                     original[s.id] = (self.assign[s.id].slot, self.assign[s.id].room)
                     # Commit: move blockers to their new homes
                     for bid, (bt, br) in best_chain.items():
@@ -604,6 +619,131 @@ class Packer:
                 a.slot = slot
                 a.room = room
         return best_placed, best_assign
+
+    def compaction_pass(self, deadline=None):
+        """Fill ALL gaps in large rooms by moving sessions using chain scheduling.
+        Move session A to gap, move blocker B to A's old spot, etc."""
+        if deadline is None:
+            deadline = float('inf')
+        
+        # 120-cap rooms
+        large_rooms = [r.name for r in self.rooms if r.capacity >= 100]
+        moves = 0
+        
+        # Compute holes for each large room per day
+        holes = self._compute_holes()
+        
+        for room in large_rooms:
+            if time.time() > deadline:
+                break
+            room_holes = holes.get(room, {})
+            for day in range(5):  # Mon-Fri
+                if time.time() > deadline:
+                    break
+                day_holes = room_holes.get(day, set())
+                if not day_holes:
+                    continue
+                
+                # Try to fill each gap
+                for gap_slot in sorted(day_holes):
+                    # Find sessions that could fit here (size <= 120, not fixed)
+                    candidates = []
+                    for s in self.sessions:
+                        if s.id not in self.assign:
+                            continue
+                        a = self.assign[s.id]
+                        if a.room in (ONLINE_ROOM, FIELD_WORK_ROOM):
+                            continue
+                        if getattr(s, "fixed_slot", None) is not None:
+                            continue
+                        if s.duration > 1 and gap_slot + 1 not in self.holes.get(room, {}).get(day, set()):
+                            continue  # Need consecutive slots for 2h sessions
+                        if room not in self.allowed[s.id]:
+                            continue
+                        # Check if session fits at this gap
+                        if self._free(s, gap_slot, room):
+                            candidates.append((s, a))
+                    
+                    # Try to move a candidate into this gap using chain scheduling
+                    for s, old_a in candidates:
+                        if s.id not in self.assign:
+                            continue
+                        if self._free(s, gap_slot, room):
+                            # Move it directly if free
+                            self._remove(s)
+                            self._place(s, gap_slot, room)
+                            moves += 1
+                            break
+        
+        return moves
+
+    def compaction_pass_with_chains(self, deadline=None):
+        """Fill gaps using chain scheduling: move A to gap, move blocker B to A's old spot, etc."""
+        if deadline is None:
+            deadline = float('inf')
+        
+        large_rooms = [r.name for r in self.problem["rooms"] if r.capacity >= 100]
+        moves = 0
+        holes = self._compute_holes()
+        
+        for room in large_rooms:
+            if time.time() > deadline:
+                break
+            room_holes = holes.get(room, {})
+            for day in range(5):
+                if time.time() > deadline:
+                    break
+                day_holes = room_holes.get(day, set())
+                if not day_holes:
+                    continue
+                
+                for gap_slot in sorted(day_holes):
+                    # Find sessions that could fit
+                    for s in self.sessions:
+                        if time.time() > deadline:
+                            break
+                        if s.id not in self.assign:
+                            continue
+                        a = self.assign[s.id]
+                        if a.room in (ONLINE_ROOM, FIELD_WORK_ROOM):
+                            continue
+                        if getattr(s, "fixed_slot", None) is not None:
+                            continue
+                        if room not in self.allowed[s.id]:
+                            continue
+                        if s.duration > 1 and gap_slot + 1 not in self.holes.get(room, {}).get(day, set()):
+                            continue
+                        
+                        if self._free(s, gap_slot, room):
+                            # Direct move
+                            self._remove(s)
+                            self._place(s, gap_slot, room)
+                            moves += 1
+                            break
+                        else:
+                            # Try chain: move blocker to s's old spot
+                            blockers = self._blockers_at(s, gap_slot, room)
+                            if not blockers:
+                                continue
+                            
+                            # Try to move one blocker to s's old spot
+                            old_slot, old_room = a.slot, a.room
+                            for bid in blockers:
+                                blocker = next((ses for ses in self.sessions if ses.id == bid), None)
+                                if not blocker or getattr(blocker, "fixed_slot", None) is not None:
+                                    continue
+                                if self._free(blocker, old_slot, old_room):
+                                    # Chain move: blocker -> s's old spot, s -> gap
+                                    self._remove(blocker)
+                                    self._place(blocker, old_slot, old_room)
+                                    self._remove(s)
+                                    self._place(s, gap_slot, room)
+                                    moves += 1
+                                    break
+                            if moves > 0:
+                                break
+        
+        return moves
 
     def _is_online_or_field(self, session_id):
         s = next((ses for ses in self.sessions if ses.id == session_id), None)
@@ -644,6 +784,14 @@ class Packer:
             m1 = self.relocate_pass(deadline)
             self.holes = self._compute_holes()
             m2 = self.swap_pass(self.active_sessions(), deadline)
+            
+            # Compaction pass: fill gaps in large rooms using chain scheduling
+            if time.time() < deadline:
+                self.holes = self._compute_holes()
+                mc = self.compaction_pass(deadline)
+                if mc:
+                    print(f"  compaction: {mc} moves", flush=True)
+            
             if m1 + m2 == 0:
                 break
         return rounds

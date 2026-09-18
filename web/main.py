@@ -331,8 +331,8 @@ def _auto_group_id(row):
     """Return a group_id when the sections span multiple programmes and the
     row doesn't already carry one.  This lets the web-editor round-trip
     cross-programme courses without requiring split_joint.py."""
-    existing = str(row.get("group_id") or "").strip()
-    if existing:
+    if "group_id" in row:
+        existing = str(row.get("group_id") or "").strip()
         return existing
     raw = str(row.get("sections") or "").strip()
     if not raw:
@@ -465,10 +465,10 @@ def _write_table(path, rows, columns):
                 out[c] = v
         data.append(out)
     df = pd.DataFrame(data, columns=columns)
-    fd, tmp = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+    fd, tmp = tempfile.mkstemp(dir=path.parent, suffix=".xlsx")
     try:
         os.close(fd)
-        df.to_excel(tmp, index=False)
+        df.to_excel(tmp, index=False, engine="openpyxl")
         os.replace(tmp, path)
     except Exception:
         try: os.unlink(tmp)

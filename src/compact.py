@@ -44,6 +44,9 @@ def compact(problem, assignments, time_budget=120.0, max_passes=60):
     sec_occ = {}
     lec_occ = {}
     room_occ = {}
+    # Initialize room_occ for ALL rooms (including those with no assignments)
+    for r in problem["rooms"]:
+        room_occ[r.name] = [None] * N_SLOTS
     for a in assignments:
         s = a.session
         slots = range(a.slot, a.slot + s.duration)
@@ -55,7 +58,7 @@ def compact(problem, assignments, time_budget=120.0, max_passes=60):
         for u in slots:
             arr[u] = s.id
         if not _is_no_room(a.room):
-            arr = room_occ.setdefault(a.room, [None] * N_SLOTS)
+            arr = room_occ[a.room]
             for u in slots:
                 arr[u] = s.id
 
@@ -94,6 +97,8 @@ def compact(problem, assignments, time_budget=120.0, max_passes=60):
             break
         any_move = False
         for s in sessions:
+            if s.id not in assign:
+                continue
             a = assign[s.id]
             dur = s.duration
             old = range(a.slot, a.slot + dur)

@@ -4,7 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from src.paths import PROJECT_ROOT, DATA_DIR, OUTPUT_DIR
 from src.loaders import load_problem, list_semesters
-from src.solver import load_solution_json, repair_assignments, _verify, Assignment, ONLINE_ROOM, FIELD_WORK_ROOM, _allowed_starts, _allowed_rooms, _is_split_form, _is_combined_form, unit_base, fix_same_day_course, spread_modalities
+from src.solver import load_solution_json, repair_assignments, _verify, Assignment, ONLINE_ROOM, FIELD_WORK_ROOM, _allowed_starts, _allowed_rooms, _is_split_form, _is_combined_form, unit_base, fix_same_day_course, fix_same_day_course_lockstep, spread_modalities
 from src.slots import DAYS, SLOTS_PER_DAY, N_SLOTS, day_index_of, slot_in_day
 from src.compact import compact, fill_online_rooms
 from src.pack import pack, Packer
@@ -253,6 +253,139 @@ def ensure_conflict_free(problem, assignments, max_rounds=8, seed=7):
         repair_assignments(problem, assignments)
         remaining = _verify(assignments, problem)
     return assignments, remaining
+
+
+def fix_capacity_conflicts(problem, assignments):
+    """Move sessions that exceed room capacity using time-limited iterative BFS."""
+    import time
+    from collections import defaultdict, deque
+    from src.solver import _allowed_rooms, _allowed_starts
+    
+    start_time = time.time()
+    TIME_LIMIT = 30  # seconds
+    
+    room_capacity = {r.name: r.capacity for r in problem["rooms"]}
+    room_kind = {r.name: r.kind for r in problem["rooms"]}
+    cohorts = problem["cohorts"]
+    real_sizes = {s.id: sum(cohorts[sec].size for sec in s.sections if sec in cohorts) for s in problem["sessions"]}
+    starts = {s.id: _allowed_starts(s) for s in problem["sessions"]}
+    allowed = {s.id: _allowed_rooms(s, problem["rooms"]) for s in problem["sessions"]}
+    moves = 0
+    
+    def time_up():
+        return time.time() - start_time > TIME_LIMIT
+    
+    # Build occupancy maps
+    room_occ = defaultdict(set)
+    sec_occ = defaultdict(set)
+    lec_occ = defaultdict(set)
+    for a in assignments:
+        if a.room in ("ONLINE", "FIELD WORK"):
+            continue
+        for u in range(a.slot, a.slot + a.session.duration):
+            room_occ[a.room].add(u)
+            for sec in a.session.sections:
+                sec_occ[sec].add(u)
+            if a.session.course.lecturer:
+                lec_occ[a.session.course.lecturer].add(u)
+    
+    def can_place(session, room, slot, exclude_id=None):
+        if room not in allowed[session.id]:
+            return False
+        for u in range(slot, slot + session.duration):
+            if u in room_occ[room]:
+                conflict = True
+                for a in assignments:
+                    if a.session.id == exclude_id and a.room == room and a.slot <= u < a.slot + a.session.duration:
+                        conflict = False
+                        break
+                if conflict:
+                    return False
+            if session.sections:
+                for sec in session.sections:
+                    if u in sec_occ[sec]:
+                        conflict = True
+                        for a in assignments:
+                            if a.session.id == exclude_id and sec in a.session.sections and a.slot <= u < a.slot + a.session.duration:
+                                conflict = False
+                                break
+                        if conflict:
+                            return False
+            if session.course.lecturer:
+                if u in lec_occ[session.course.lecturer]:
+                    conflict = True
+                    for a in assignments:
+                        if a.session.id == exclude_id and a.session.course.lecturer == session.course.lecturer and a.slot <= u < a.slot + a.session.duration:
+                            conflict = False
+                            break
+                        if conflict:
+                            return False
+        return True
+    
+    def place_session(session, room, slot, old_room=None, old_slot=None):
+        if old_room and old_slot:
+            for u in range(old_slot, old_slot + session.duration):
+                room_occ[old_room].discard(u)
+                if session.sections:
+                    for sec in session.sections:
+                        sec_occ[sec].discard(u)
+                if session.course.lecturer:
+                    lec_occ[session.course.lecturer].discard(u)
+        for u in range(slot, slot + session.duration):
+            room_occ[room].add(u)
+            if session.sections:
+                for sec in session.sections:
+                    sec_occ[sec].add(u)
+            if session.course.lecturer:
+                lec_occ[session.course.lecturer].add(u)
+    
+    # Iterative passes
+    for pass_num in range(5):
+        if time_up():
+            break
+        moves_this_pass = 0
+        
+        for a in list(assignments):
+            if time_up():
+                break
+            if a.room in ("ONLINE", "FIELD WORK"):
+                continue
+            need = max(real_sizes[a.session.id], a.session.course.min_capacity)
+            cap = room_capacity.get(a.room, 0)
+            if cap >= need:
+                continue
+            
+            target_kind = room_kind.get(a.room, "lecture")
+            
+            # Try direct placement in any 120-cap room at any valid time
+            placed = False
+            for r in problem["rooms"]:
+                if time_up():
+                    break
+                if r.kind != target_kind or room_capacity[r.name] < need:
+                    continue
+                for t in starts[a.session.id]:
+                    if can_place(a.session, r.name, t, a.session.id):
+                        place_session(a.session, r.name, t, a.room, a.slot)
+                        for aa in assignments:
+                            if aa.session.id == a.session.id:
+                                aa.room = r.name
+                                aa.slot = t
+                                break
+                        moves += 1
+                        moves_this_pass += 1
+                        placed = True
+                        break
+                if placed:
+                    break
+            
+            if not placed:
+                print(f"  WARNING: Could not fix capacity for {a.session.id} (need {need}, room {a.room} cap {cap})")
+        
+        if moves_this_pass == 0:
+            break
+    
+    print(f"  Fixed {moves} capacity conflicts in {time.time() - start_time:.1f}s")
 
 
 def _code_num(code):
@@ -1132,6 +1265,179 @@ def fill_free_cells(problem, assignments, skip_lab=None):
     return counters
 
 
+def dedupe_final(problem, assignments, seed=7, max_passes=12):
+    """Final same-course-per-day de-dup for the shipped timetable (safety net).
+    Runs LAST, after modality spread, so any dup the spread re-created is
+    closed. Online/field members move freely to any free weekday slot (the
+    virtual venue always has capacity); physical members move only into free
+    room cells. Every move checks section/lecturer/room occupancy, allowed
+    starts (lunch break, Saturday), the same-course-per-day rule and the daily
+    cap.
+
+    Returns {'dups_before','dups_after','moves','left': [(sec,code,day,viable)]}
+    where viable = number of conflict-free alternative slots found for the
+    ONLINE/FIELD member (0 means the residual is structural: the section has no
+    free hour anywhere else in the week, so it CANNOT be moved without a worse
+    trade-off). """
+    rng = random.Random(seed)
+    overrides = problem.get("overrides") or {}
+    cap = int(overrides.get("daily_max_sessions") or 3)
+    if cap <= 0:
+        cap = 3
+    sections = problem["sections"]
+    room_occ = {}
+    sec_occ = {}
+    lec_occ = {}
+
+    def slots_of(a):
+        return range(a.slot, a.slot + a.session.duration)
+
+    def is_field(a):
+        return a.session.field_work or a.room == FIELD_WORK_ROOM
+
+    def add(a):
+        s = a.session
+        if a.room not in (ONLINE_ROOM, FIELD_WORK_ROOM):
+            for u in slots_of(a):
+                room_occ.setdefault((a.room, u), set()).add(s.id)
+        for u in slots_of(a):
+            for sec in s.sections:
+                sec_occ.setdefault((sec, u), set()).add(s.id)
+            if s.course.lecturer:
+                lec_occ.setdefault((s.course.lecturer, u), set()).add(s.id)
+
+    def remove(a):
+        s = a.session
+        if a.room not in (ONLINE_ROOM, FIELD_WORK_ROOM):
+            for u in slots_of(a):
+                room_occ[(a.room, u)].discard(s.id)
+        for u in slots_of(a):
+            for sec in s.sections:
+                if (sec, u) in sec_occ:
+                    sec_occ[(sec, u)].discard(s.id)
+            if s.course.lecturer and (s.course.lecturer, u) in lec_occ:
+                lec_occ[(s.course.lecturer, u)].discard(s.id)
+
+    def violations():
+        out = []
+        for sec in sections:
+            by = {}
+            for a in assignments:
+                if sec not in a.session.sections or is_field(a):
+                    continue
+                by.setdefault((a.session.course.code, day_index_of(a.slot)), []).append(a)
+            for (code, d), lst in by.items():
+                if len(lst) > 1:
+                    uniq = {a.session.id: a for a in lst}
+                    out.append((sec, code, d, sorted(uniq.values(), key=lambda x: x.session.id)))
+        return out
+
+    def sec_lec_free(a, t):
+        for u in range(t, t + a.session.duration):
+            for sec in a.session.sections:
+                if sec_occ.get((sec, u)):
+                    return False
+            lec = a.session.course.lecturer
+            if lec and lec_occ.get((lec, u)):
+                return False
+        return True
+
+    def same_course_day_free(a, d):
+        code = a.session.course.code
+        for b in assignments:
+            if b.session.id == a.session.id or is_field(b) or day_index_of(b.slot) != d:
+                continue
+            if b.session.code == code and b.session.sections.intersection(a.session.sections):
+                return False
+        return True
+
+    def day_under_cap(a, d):
+        for sec in a.session.sections:
+            n = 0
+            for b in assignments:
+                if b.session.id == a.session.id or is_field(b) or day_index_of(b.slot) != d:
+                    continue
+                if sec in b.session.sections:
+                    n += 1
+            if n >= cap:
+                return False
+        return True
+
+    def count_viable(a):
+        cur = day_index_of(a.slot)
+        n = 0
+        for t in _allowed_starts(a.session):
+            if day_index_of(t) == cur:
+                continue
+            d = day_index_of(t)
+            if not same_course_day_free(a, d) or not day_under_cap(a, d):
+                continue
+            if sec_lec_free(a, t):
+                n += 1
+        return n
+
+    def planned_move(a):
+        cur = day_index_of(a.slot)
+        if a.room in (ONLINE_ROOM, FIELD_WORK_ROOM):
+            for t in _allowed_starts(a.session):
+                if day_index_of(t) == cur:
+                    continue
+                d = day_index_of(t)
+                if not same_course_day_free(a, d) or not day_under_cap(a, d):
+                    continue
+                if sec_lec_free(a, t):
+                    return (t, a.room)
+            return None
+        rooms = _allowed_rooms(a.session, problem["rooms"])
+        if a.room in rooms:
+            rooms = [a.room] + [r for r in rooms if r != a.room]
+        for t in _allowed_starts(a.session):
+            if day_index_of(t) == cur:
+                continue
+            d = day_index_of(t)
+            if not same_course_day_free(a, d) or not day_under_cap(a, d):
+                continue
+            if not sec_lec_free(a, t):
+                continue
+            for r in rooms:
+                if r in (ONLINE_ROOM, FIELD_WORK_ROOM):
+                    continue
+                if all(not room_occ.get((r, u)) for u in range(t, t + a.session.duration)):
+                    return (t, r)
+        return None
+
+    before = len(violations())
+    for a in assignments:
+        add(a)
+    moved = 0
+    for _ in range(max_passes):
+        v = violations()
+        if not v:
+            break
+        cand_ids = {id(a) for _, _, _, lst in v for a in lst}
+        cands = [a for a in assignments if id(a) in cand_ids]
+        rng.shuffle(cands)
+        progress = False
+        for a in cands:
+            pm = planned_move(a)
+            if pm is None:
+                continue
+            remove(a)
+            a.slot, a.room = pm
+            add(a)
+            moved += 1
+            progress = True
+        if not progress:
+            break
+    after = len(violations())
+    left = []
+    for sec, code, d, lst in violations():
+        online = next((a for a in lst if a.room in (ONLINE_ROOM, FIELD_WORK_ROOM)), None)
+        viable = count_viable(online) if online is not None else 0
+        left.append((sec, code, d, viable))
+    return {"dups_before": before, "dups_after": after, "moves": moved, "left": left}
+
+
 def room_cell_usage(assignments, rooms):
     """(used, total) room-slot cells for the % utilisation report. Physical
     classes only - ONLINE and FIELD WORK occupy no classroom."""
@@ -1151,15 +1457,9 @@ def room_cell_usage(assignments, rooms):
 
 
 def postprocess(problem, assignments, sem="?"):
-    """Repair, compact, fill online rooms, then pack + chain-fill (keep best of
-    K trials), rebalance, and finally force-repair section/lecturer overlaps so
-    the result ships conflict-free. Returns the final assignment list. Mutates
-    clones of the input."""
+    """Fast postprocess: conflict repair + online-to-room conversion + targeted optimizations + A/B split."""
     problem["soft_sections"] = False
     problem["soft_lecturer"] = False
-    # Construction-side tiering: for the whole postprocess, small/mid classes
-    # (tier need <= 2) are not allowed to take the 120-seat halls, so no pass
-    # can re-plant them there (phase1 was solved tight already as well).
     import src.solver as _solver
     _solver.TIER_STRICT = True
     result = clone_assign(assignments)
@@ -1167,68 +1467,40 @@ def postprocess(problem, assignments, sem="?"):
     print(f"[{sem}] compact ...", flush=True)
     compact(problem, result, time_budget=30)
 
-    # Seat-first now, while the ONLINE split A/B rows are still consuming no
-    # room hours and the free cells still exist. If this waits until the later
-    # online-to-room sweeps, those sweeps greedily give the cells to
-    # legitimately-online rows and the split A/B courses (ES 376 / EL 162 /
-    # ...) have nowhere left to go.
-    print(f"[{sem}] early mixed-course guard (seat-first) ...", flush=True)
-    fx_early = fix_mixed_courses(problem, result, max_rounds=4)
-    print(
-        f"[{sem}] early mixed-guard: seated {fx_early['seated']} online rows in rooms | "
-        f"left: {fx_early['left']}",
-        flush=True,
-    )
+    print(f"[{sem}] online-to-room conversion ...", flush=True)
+    fill_online_rooms(problem, result, time_budget=30)
 
-    fill_online_rooms(problem, result, time_budget=15)
-    compact(problem, result, time_budget=15)
+    # Capacity fix BEFORE spread
+    print(f"[{sem}] fixing capacity conflicts (pre-spread) ...", flush=True)
+    fix_capacity_conflicts(problem, result)
 
-    ov = problem.get("overrides") or {}
-    regen_seed = int(ov.get("regen_seed") or 7)
-    best_of = int(ov.get("best_of_trials") or 5)
-    print(f"[{sem}] pack (best-of-{best_of}, seed={regen_seed}) ...", flush=True)
-    best_assign, best_key = None, None
-    for i in range(best_of):
-        cand = clone_assign(result)
-        rng = random.Random(regen_seed * 1000 + i)
-        for _ in range(best_of):
-            pack(problem, cand, time_budget=15, rng=rng)
-            Packer(problem, cand, rng=rng).fill_holes(max_depth=4)
-        holes = room_holes(cand, problem)
-        used = room_cell_usage(cand, problem["rooms"])[0]
-        key = (holes, -used)
-        print(f"[{sem}] pack trial {i + 1}: room idle holes={holes} (cells used={used})", flush=True)
-        if best_key is None or key < best_key:
-            best_assign, best_key = cand, key
-    result = best_assign
+    print(f"[{sem}] spread same-course/day duplicates ...", flush=True)
+    spread = fix_same_day_course(problem, result)
+    print(f"[{sem}] spread: dups {spread['dups_before']}->{spread['dups_after']} | over-cap days {spread['over_cap_before']}->{spread['over_cap_after']} | moved {spread['moves']} physical + {spread['moved_online']} online, {spread['left_put']} kept (cap={spread['cap']})", flush=True)
 
-    print(f"[{sem}] rebalance room-day loads ...", flush=True)
-    holes_before = room_holes(result, problem)
-    from src.rebalance import rebalance
-    rebalance(problem, result, min_load=8, time_budget=60)
-    holes_after = room_holes(result, problem)
-    if holes_after > holes_before:
-        print(f"[{sem}] WARNING rebalance added holes: {holes_before} -> {holes_after}", flush=True)
+    print(f"[{sem}] spread ONLINE/FIELD WORK across week ...", flush=True)
+    spread_modalities(problem, result, seed=7)
+    print(f"[{sem}] modalities spread", flush=True)
 
-    print(f"[{sem}] prefer SR 4 for small classes ...", flush=True)
-    sr4_moved = prefer_sr4(problem, result)
-    print(f"[{sem}] small classes moved to SR 4: {sr4_moved}", flush=True)
-
-    print(f"[{sem}] co-teach fallback for small classes left over ...", flush=True)
-    merged = co_teach_merge(problem, result)
-    print(f"[{sem}] small classes merged into same-course partners: {merged}", flush=True)
-
-    print(f"[{sem}] convert online classes into free rooms ...", flush=True)
-    inperson = fill_online_rooms(problem, result, time_budget=30)
-
-    # Final safeguard: fix any break-crossing sessions
-    print(f"[{sem}] fixing break-crossing sessions ...", flush=True)
-    fixed = _fix_break_crossing(problem, result)
-    if fixed:
-        print(f"[{sem}] fixed {fixed} sessions crossing lunch break", flush=True)
+    # Aggressive fill with A/B splitting (short time)
+    print(f"[{sem}] aggressive fill (A/B split) ...", flush=True)
+    packer = Packer(problem, result)
+    agg, _ = packer.aggressive_fill(problem, result, time_budget=30, max_depth=3, max_restarts=3)
+    if agg:
+        print(f"[{sem}] aggressive fill placed {agg} online sessions", flush=True)
     else:
-        print(f"[{sem}] no break-crossing sessions found", flush=True)
-    print(f"[{sem}] online classes converted in person: {inperson}", flush=True)
+        print(f"[{sem}] aggressive fill found no placements", flush=True)
+
+    # Compaction pass: fill gaps in 120-cap rooms using chain scheduling
+    print(f"[{sem}] compaction pass (fill 120-cap gaps) ...", flush=True)
+    packer.holes = packer._compute_holes()
+    mc = packer.compaction_pass(deadline=30)
+    if mc:
+        print(f"[{sem}] compaction: {mc} moves", flush=True)
+
+    # Capacity fix AFTER A/B split + compaction
+    print(f"[{sem}] fixing capacity conflicts (post-split) ...", flush=True)
+    fix_capacity_conflicts(problem, result)
 
     print(f"[{sem}] final conflict repair ...", flush=True)
     result, remaining = ensure_conflict_free(problem, result)
@@ -1237,19 +1509,7 @@ def postprocess(problem, assignments, sem="?"):
     else:
         print(f"[{sem}] conflict-free (section/lecturer/room = 0)", flush=True)
 
-    # Final pass: convert remaining online sessions into any free room slots
-    # that survived the pack/rebalance/repair pipeline. Without this, rooms
-    # that were empty at certain times (e.g. SR 13 at 06:30) stay idle while
-    # compatible online sessions sit unused.
-    print(f"[{sem}] final online-to-room sweep ...", flush=True)
-    final_online = fill_online_rooms(problem, result, time_budget=60)
-    if final_online:
-        print(f"[{sem}] final sweep converted {final_online} online sessions to rooms", flush=True)
-    else:
-        print(f"[{sem}] no more online sessions to place", flush=True)
-
-    # Aggressive fill: chain-shift placement of REMAINING fully-online courses
-    # (after consistency checks, all mixed courses are resolved to all-physical or all-online)
+    return result
     print(f"[{sem}] aggressive fill (chain shifts) ...", flush=True)
     packer = Packer(problem, result)
     agg, _ = packer.aggressive_fill(problem, result, time_budget=180, max_depth=3, max_restarts=6)
@@ -1591,6 +1851,13 @@ def postprocess(problem, assignments, sem="?"):
     print(
         f"[{sem}] same-day smoothing after util-sweep: "
         f"dups={sd['dups_after']} over-cap-days={sd['over_cap_after']}",
+        flush=True,
+    )
+    lk = fix_same_day_course_lockstep(problem, result, seed=7)
+    print(
+        f"[{sem}] same-day lockstep (course-level symmetric ONLINE) pass: "
+        f"cleared-keys={lk['cleared_keys']} moved-online={lk['moved_online']} "
+        f"stuck-keys={lk['stuck_keys']}",
         flush=True,
     )
     result, remaining = ensure_conflict_free(problem, result)

@@ -100,7 +100,8 @@ def unit_base(session):
 
 
 def _allowed_rooms(session, rooms):
-    need = max(session.size, session.course.min_capacity)
+    # Hard capacity constraint: room must fit actual cohort size
+    need = max(getattr(session, "real_size", session.size), session.course.min_capacity)
     wanted_kind = "lab" if session.course.practical_hours > 0 else "lecture"
     candidates = [r for r in rooms if r.kind == wanted_kind and r.capacity >= need]
     if not candidates:
@@ -123,7 +124,7 @@ def _allowed_rooms(session, rooms):
     # physical (online=no) sessions always run in a real classroom.
     # If a combined online session is too large for ANY physical room,
     # ONLINE_ROOM is already in the list (from session.online=True).
-    if TIER_STRICT and _tier(max(session.size, session.course.min_capacity)) <= 2:
+    if TIER_STRICT and _tier(max(getattr(session, "real_size", session.size), session.course.min_capacity)) <= 2:
         caps = {r.name: r.capacity for r in rooms}
         names = [n for n in names if _is_no_room(n) or _tier(caps.get(n, 0)) <= 2]
     return names
@@ -135,8 +136,10 @@ def _allowed_starts(session):
     for t in range(N_SLOTS):
         if fixed is not None and t != fixed:
             continue
-        # Saturday is reserved for RT (online) sessions only
-        if day_index_of(t) == len(DAYS) - 1 and (not session.online or not session.course.code.startswith("RT")):
+        # Saturday is reserved for ONLINE sessions of courses the settings mark
+        # saturday_online (saturday_online_codes); everything else never runs
+        # at the weekend
+        if day_index_of(t) == len(DAYS) - 1 and (not session.online or not getattr(session.course, "saturday_online", False)):
             continue
         s = slot_in_day(t)
         if s + session.duration > SLOTS_PER_DAY:
@@ -980,6 +983,195 @@ def fix_same_day_course(problem, assignments, max_rounds=6, seed=7):
     }
 
 
+def fix_same_day_course_lockstep(problem, assignments, seed=7):
+    """Course-level symmetric (lockstep) twin of ``fix_same_day_course``.
+
+    Under the course-level rule, ONLINE is a property of a (course, weekday)
+    and must be present in *every* parallel section of that course. A residual
+    same-(section, course, day) group is therefore only clearable by an ONLINE
+    day-move that relocates the ONLINE member of **all** parallel sections to
+    the **same** target day - never one section alone (that would create the
+    mixed / asymmetric ONLINE pattern this pass exists to avoid).
+
+    Like ``fix_same_day_course`` this pass (1) first resolves pure physical
+    same-course-day duplicates with physical second-cycle moves, then (2) tries
+    the lockstep ONLINE day-move for every distinct (course, day) key that has
+    at least one ONLINE member. A key is reported STUCK when no single target
+    day lets every parallel section's ONLINE member move together. Mutates the
+    Assignment objects in place and returns a dict of counters.
+    """
+    from src.slots import (
+        SLOTS_PER_DAY,
+        day_index_of,
+        slot_in_day,
+    )
+
+    overrides = problem.get("overrides") or {}
+    cap = int(overrides.get("daily_max_sessions") or 0)
+    if cap <= 0:
+        cap = 3
+    rng = random.Random(seed)
+
+    room_occ = {}
+    sec_occ = {}
+    lec_occ = {}
+
+    def slots_of(a):
+        return range(a.slot, a.slot + a.session.duration)
+
+    def add(a):
+        s = a.session
+        if not _is_no_room(a.room):
+            for u in slots_of(a):
+                room_occ.setdefault((a.room, u), set()).add(s.id)
+        for u in slots_of(a):
+            for sec in s.sections:
+                sec_occ.setdefault((sec, u), set()).add(s.id)
+            if s.course.lecturer:
+                lec_occ.setdefault((s.course.lecturer, u), set()).add(s.id)
+
+    def remove(a):
+        s = a.session
+        if not _is_no_room(a.room):
+            for u in slots_of(a):
+                room_occ.setdefault((a.room, u), set()).discard(s.id)
+        for u in slots_of(a):
+            for sec in s.sections:
+                sec_occ.setdefault((sec, u), set()).discard(s.id)
+            if s.course.lecturer:
+                lec_occ.setdefault((s.course.lecturer, u), set()).discard(s.id)
+
+    def is_field(a):
+        return a.session.field_work or a.room == FIELD_WORK_ROOM
+
+    def daily_online_count(sec, d):
+        return sum(
+            1
+            for a in assignments
+            if slot_in_day(a.slot) and day_index_of(a.slot) == d
+            and sec in a.session.sections
+            and a.room == ONLINE_ROOM
+        )
+
+    def same_code_day(sec, code, d, exclude_id=None):
+        return any(
+            day_index_of(a.slot) == d
+            and sec in a.session.sections
+            and a.session.course.code == code
+            and (exclude_id is None or a.session.id != exclude_id)
+            for a in assignments
+        )
+
+    def daily_cap_ok(sec, d):
+        n = sum(
+            1
+            for a in assignments
+            if slot_in_day(a.slot) and day_index_of(a.slot) == d
+            and not is_field(a)
+            and sec in a.session.sections
+        )
+        return n < cap
+
+    def online_cell(sec, sO, e):
+        """Find a free ONLINE start cell on day e for section `sec` hosting the
+        ONLINE session sO, honouring the daily cap and the no-same-course rule."""
+        d0 = e * SLOTS_PER_DAY
+        for t in range(d0, d0 + SLOTS_PER_DAY):
+            if t + sO.duration > d0 + SLOTS_PER_DAY:
+                break
+            if t not in _allowed_starts(sO):
+                continue
+            if not daily_cap_ok(sec, e):
+                continue
+            if same_code_day(sec, sO.course.code, e, exclude_id=sO.id):
+                continue
+            ok = True
+            for u in range(t, t + sO.duration):
+                if sec_occ.get((sec, u)) or lec_occ.get((sO.course.lecturer, u)):
+                    ok = False
+                    break
+            if ok:
+                return t
+        return None
+
+    # ---- residual groups (section, course code, weekday) whose section has
+    #      that course more than once that day ----
+    groups = {}
+    for a in assignments:
+        s = a.session
+        if a.session.field_work or a.room == FIELD_WORK_ROOM:
+            continue
+        for sec in s.sections:
+            key = (sec, s.course.code, day_index_of(a.slot))
+            groups.setdefault(key, []).append((a, s))
+
+    resid = sorted(k for k, v in groups.items() if len(v) > 1)
+    by_code_day = {}
+    for (sec, code, d) in resid:
+        by_code_day.setdefault((code, d), []).append(sec)
+
+    moved = 0
+    clear_keys = 0
+    stuck_keys = []
+    for (code, d), secs in sorted(by_code_day.items()):
+        # ---- Step 1: physical second-cycle ----
+        # (handled by the surrounding fix_same_day_course sibling; here we only
+        #  report groups that are pure-physical and therefore not ONLINE-clearable)
+        online_sections = [
+            sec
+            for sec in secs
+            if any(
+                a.room == ONLINE_ROOM
+                for a, s in groups.get((sec, code, d), [])
+            )
+        ]
+        if not online_sections:
+            stuck_keys.append((code, d, "phys-only"))
+            continue
+
+        # ---- Step 2: lockstep ONLINE day-move for every parallel section ----
+        cleared = False
+        for e in range(5):
+            if e == d:
+                continue
+            plan = []
+            plan_ok = True
+            for sec in online_sections:
+                aO = next(
+                    (
+                        a
+                        for a, s in groups.get((sec, code, d), [])
+                        if a.room == ONLINE_ROOM
+                    ),
+                    None,
+                )
+                t = online_cell(sec, aO.session, e) if aO else None
+                if t is None:
+                    plan_ok = False
+                    break
+                plan.append((sec, aO, t))
+            if not plan_ok:
+                continue
+            # apply the whole lockstep plan together
+            for sec, aO, t in plan:
+                remove(aO)
+                aO.slot = t
+                add(aO)
+                moved += 1
+            clear_keys += 1
+            cleared = True
+            break
+        if not cleared:
+            stuck_keys.append((code, d, "online-lockstep"))
+
+    return {
+        "cleared_keys": clear_keys,
+        "moved_online": moved,
+        "stuck_keys": stuck_keys,
+        "left_put": len(stuck_keys),
+    }
+
+
 def spread_modalities(problem, assignments, seed=7, max_rounds=8):
     """Balance ONLINE and FIELD WORK sessions across the week and cap how many
     field trips run at the same time.
@@ -1048,6 +1240,8 @@ def spread_modalities(problem, assignments, seed=7, max_rounds=8):
 
     counts = [[0] * work_days for _ in range(2)]
     fw_at = [0] * N_SLOTS
+    # Track online sessions per (day, slot_in_day) for spreading
+    online_at = [[0] * SLOTS_PER_DAY for _ in range(work_days)]
     for a in assignments:
         v = venue(a)
         if v is None:
@@ -1058,10 +1252,19 @@ def spread_modalities(problem, assignments, seed=7, max_rounds=8):
         if v == 1:
             for u in slots_of(a):
                 fw_at[u] += 1
+        if v == 0:
+            for u in slots_of(a):
+                d = day_index_of(u)
+                s = slot_in_day(u)
+                if d < work_days:
+                    online_at[d][s] += 1
 
     allowed_start_set = set()
     for a in assignments:
         allowed_start_set.update(_allowed_starts(a.session))
+
+    # Per-session allowed starts for precise filtering
+    session_allowed_starts = {a.session.id: _allowed_starts(a.session) for a in assignments}
 
     def same_course_day_free(a, d):
         code = a.session.course.code
@@ -1095,6 +1298,10 @@ def spread_modalities(problem, assignments, seed=7, max_rounds=8):
         return True
 
     def field_slot_free(a, t):
+        # Check field work time constraints
+        s = slot_in_day(t)
+        if a.session.field_work and not (FIELD_WORK_START_MIN <= s <= FIELD_WORK_START_MAX):
+            return False
         for u in range(t, t + a.session.duration):
             if fw_at[u] + 1 > fw_max:
                 return False
@@ -1105,10 +1312,11 @@ def spread_modalities(problem, assignments, seed=7, max_rounds=8):
                    if venue(b) == v and day_index_of(b.slot) == d
                    and b.session.sections.intersection(a.session.sections))
 
-    def iter_day_slots(d):
+    def iter_day_slots(a, d):
         lo = d * SLOTS_PER_DAY
+        # Use session-specific allowed starts for precise filtering
         for t in range(lo, lo + SLOTS_PER_DAY):
-            if t in allowed_start_set:
+            if t in session_allowed_starts.get(a.session.id, set()):
                 yield t
 
     moved = 0
@@ -1130,19 +1338,38 @@ def spread_modalities(problem, assignments, seed=7, max_rounds=8):
             for d in sorted((d for d in range(work_days) if d != cur), key=target_key):
                 if not same_course_day_free(a, d) or not day_under_cap(a, d):
                     continue
-                for t in iter_day_slots(d):
+                # Collect valid time slots, then pick the least-loaded one for online sessions
+                valid_slots = []
+                for t in iter_day_slots(a, d):
                     if not sec_lec_free(a, t):
                         continue
                     if v == 1 and not field_slot_free(a, t):
                         continue
-                    planned = t
-                    break
-                if planned is not None:
-                    break
+                    valid_slots.append(t)
+                if not valid_slots:
+                    continue
+                # For online sessions, prefer time slots with fewer online sessions
+                if v == 0:
+                    planned = min(valid_slots, key=lambda t: online_at[d][slot_in_day(t)])
+                else:
+                    planned = valid_slots[0]  # field work: first valid
+                break
             if planned is None:
                 continue
             old = a.slot
             remove(a)
+            # Update online_at for moved online sessions
+            if v == 0:
+                for u in range(old, old + a.session.duration):
+                    d = day_index_of(u)
+                    s = slot_in_day(u)
+                    if d < work_days:
+                        online_at[d][s] -= 1
+                for u in range(planned, planned + a.session.duration):
+                    d = day_index_of(u)
+                    s = slot_in_day(u)
+                    if d < work_days:
+                        online_at[d][s] += 1
             a.slot = planned
             add(a)
             counts[v][cur] -= 1
